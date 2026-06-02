@@ -90,6 +90,17 @@ final class OutlineStore: ObservableObject {
         return child.id
     }
 
+    func indent(_ id: UUID) {
+        guard let parentID = previousVisibleItem(before: id), let item = remove(id, from: &items) else {
+            return
+        }
+
+        update(parentID) { parent in
+            parent.isExpanded = true
+            parent.children.append(item)
+        }
+    }
+
     func toggleExpanded(_ id: UUID) {
         update(id) { item in
             item.isExpanded.toggle()
@@ -205,6 +216,18 @@ final class OutlineStore: ObservableObject {
         return false
     }
 
+    private func remove(_ id: UUID, from source: inout [OutlineItem]) -> OutlineItem? {
+        for index in source.indices {
+            if source[index].id == id {
+                return source.remove(at: index)
+            }
+            if let removed = remove(id, from: &source[index].children) {
+                return removed
+            }
+        }
+        return nil
+    }
+
     private func flatten(_ source: [OutlineItem], depth: Int) -> [VisibleOutlineItem] {
         source.flatMap { item -> [VisibleOutlineItem] in
             var rows = [VisibleOutlineItem(id: item.id, depth: depth)]
@@ -273,6 +296,10 @@ struct ContentView: View {
                             onCreateRow: {
                                 let newID = store.addSibling(after: item.id)
                                 editingItemID = newID
+                            },
+                            onIndent: {
+                                store.indent(item.id)
+                                editingItemID = item.id
                             }
                         )
                     }
@@ -280,7 +307,7 @@ struct ContentView: View {
                 .padding(24)
             }
         }
-        .background(colorScheme == .dark ? Color.black : Color(nsColor: .textBackgroundColor))
+        .background(colorScheme == .dark ? Color(red: 0.08, green: 0.08, blue: 0.09) : Color(nsColor: .textBackgroundColor))
         .frame(minWidth: 720, minHeight: 520)
         .toolbar {
             Button {
@@ -334,6 +361,7 @@ struct OutlineRow: View {
     let onMoveUp: () -> Void
     let onMoveDown: () -> Void
     let onCreateRow: () -> Void
+    let onIndent: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -341,8 +369,8 @@ struct OutlineRow: View {
                 .frame(width: CGFloat(item.depth) * 28)
 
             Button(action: onToggleExpanded) {
-                Image(systemName: childCount == 0 ? "circle.fill" : isExpanded ? "chevron.down.circle.fill" : "chevron.right.circle.fill")
-                    .font(.system(size: childCount == 0 ? 6 : 14))
+                Image(systemName: childCount == 0 ? "circle.fill" : isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: childCount == 0 ? 6 : 10))
                     .foregroundStyle(.secondary)
                     .frame(width: 18, height: 24)
             }
@@ -360,6 +388,10 @@ struct OutlineRow: View {
                 }
                 .onKeyPress(.downArrow) {
                     onMoveDown()
+                    return .handled
+                }
+                .onKeyPress(.tab) {
+                    onIndent()
                     return .handled
                 }
 
