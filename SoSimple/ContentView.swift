@@ -101,6 +101,10 @@ final class OutlineStore: ObservableObject {
         }
     }
 
+    func outdent(_ id: UUID) {
+        _ = outdent(id, in: &items)
+    }
+
     func toggleExpanded(_ id: UUID) {
         update(id) { item in
             item.isExpanded.toggle()
@@ -228,6 +232,21 @@ final class OutlineStore: ObservableObject {
         return nil
     }
 
+    private func outdent(_ id: UUID, in source: inout [OutlineItem]) -> Bool {
+        for parentIndex in source.indices {
+            if let childIndex = source[parentIndex].children.firstIndex(where: { $0.id == id }) {
+                let item = source[parentIndex].children.remove(at: childIndex)
+                source.insert(item, at: source.index(after: parentIndex))
+                return true
+            }
+
+            if outdent(id, in: &source[parentIndex].children) {
+                return true
+            }
+        }
+        return false
+    }
+
     private func flatten(_ source: [OutlineItem], depth: Int) -> [VisibleOutlineItem] {
         source.flatMap { item -> [VisibleOutlineItem] in
             var rows = [VisibleOutlineItem(id: item.id, depth: depth)]
@@ -253,7 +272,7 @@ final class OutlineStore: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var store = OutlineStore()
-    @FocusState private var editingItemID: UUID?
+    @State private var editingItemID: UUID?
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
@@ -300,6 +319,10 @@ struct ContentView: View {
                             onIndent: {
                                 store.indent(item.id)
                                 editingItemID = item.id
+                            },
+                            onOutdent: {
+                                store.outdent(item.id)
+                                editingItemID = item.id
                             }
                         )
                     }
@@ -308,6 +331,22 @@ struct ContentView: View {
             }
         }
         .background(colorScheme == .dark ? Color(red: 0.08, green: 0.08, blue: 0.09) : Color(nsColor: .textBackgroundColor))
+        .overlay {
+            RowKeyboardMonitor(
+                editingItemID: $editingItemID,
+                onMoveUp: { id in
+                    if let previousID = store.previousVisibleItem(before: id) {
+                        editingItemID = previousID
+                    }
+                },
+                onMoveDown: { id in
+                    if let nextID = store.nextVisibleItem(after: id) {
+                        editingItemID = nextID
+                    }
+                }
+            )
+            .frame(width: 0, height: 0)
+        }
         .frame(minWidth: 720, minHeight: 520)
         .toolbar {
             Button {
@@ -353,7 +392,7 @@ struct OutlineRow: View {
     @Binding var title: String
     let isExpanded: Bool
     let childCount: Int
-    @FocusState.Binding var editingItemID: UUID?
+    @Binding var editingItemID: UUID?
 
     let onToggleExpanded: () -> Void
     let onFocus: () -> Void
@@ -362,6 +401,7 @@ struct OutlineRow: View {
     let onMoveDown: () -> Void
     let onCreateRow: () -> Void
     let onIndent: () -> Void
+    let onOutdent: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -386,7 +426,8 @@ struct OutlineRow: View {
                 onMoveUp: onMoveUp,
                 onMoveDown: onMoveDown,
                 onCreateRow: onCreateRow,
-                onIndent: onIndent
+                onIndent: onIndent,
+                onOutdent: onOutdent
             )
             .frame(height: 34)
 
@@ -404,7 +445,7 @@ struct OutlineRow: View {
             .buttonStyle(.borderless)
             .help("Add child")
         }
-        .frame(height: 34, alignment: .center)
+        .frame(height: 15, alignment: .center)
         .padding(.vertical, 6)
         .padding(.horizontal, 8)
     }
@@ -413,48 +454,55 @@ struct OutlineRow: View {
 struct OutlineTextField: NSViewRepresentable {
     let id: UUID
     @Binding var text: String
-    @FocusState.Binding var editingItemID: UUID?
+    @Binding var editingItemID: UUID?
     let onMoveUp: () -> Void
     let onMoveDown: () -> Void
     let onCreateRow: () -> Void
     let onIndent: () -> Void
+    let onOutdent: () -> Void
 
-    func makeNSView(context: Context) -> KeyHandlingTextField {
-        let textField = KeyHandlingTextField()
-        textField.cell = VerticallyCenteredTextFieldCell()
-        textField.isBordered = false
-        textField.isBezeled = false
-        textField.drawsBackground = false
-        textField.focusRingType = .none
-        textField.font = .systemFont(ofSize: 16)
-        textField.lineBreakMode = .byTruncatingTail
-        textField.cell?.wraps = false
-        textField.cell?.usesSingleLineMode = true
-        textField.delegate = context.coordinator
-        textField.onMoveUp = onMoveUp
-        textField.onMoveDown = onMoveDown
-        textField.onCreateRow = onCreateRow
-        textField.onIndent = onIndent
-        return textField
+    func makeNSView(context: Context) -> KeyHandlingTextView {
+        let textView = KeyHandlingTextView()
+        textView.drawsBackground = false
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.allowsUndo = true
+        textView.font = .systemFont(ofSize: 16)
+        textView.textContainerInset = NSSize(width: 0, height: 7)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.maximumNumberOfLines = 1
+        textView.textContainer?.lineBreakMode = .byTruncatingTail
+        textView.delegate = context.coordinator
+        textView.onMoveUp = onMoveUp
+        textView.onMoveDown = onMoveDown
+        textView.onCreateRow = onCreateRow
+        textView.onIndent = onIndent
+        textView.onOutdent = onOutdent
+        return textView
     }
 
-    func updateNSView(_ textField: KeyHandlingTextField, context: Context) {
+    func updateNSView(_ textView: KeyHandlingTextView, context: Context) {
         context.coordinator.parent = self
 
-        if textField.stringValue != text {
-            textField.stringValue = text
+        if textView.string != text {
+            textView.string = text
         }
 
-        textField.onMoveUp = onMoveUp
-        textField.onMoveDown = onMoveDown
-        textField.onCreateRow = onCreateRow
-        textField.onIndent = onIndent
+        textView.onMoveUp = onMoveUp
+        textView.onMoveDown = onMoveDown
+        textView.onCreateRow = onCreateRow
+        textView.onIndent = onIndent
+        textView.onOutdent = onOutdent
+        textView.delegate = context.coordinator
 
         let shouldEdit = editingItemID == id
-        let isFirstResponder = textField.window?.firstResponder === textField.currentEditor()
+        let isFirstResponder = textView.window?.firstResponder === textView
         if shouldEdit, !isFirstResponder {
             DispatchQueue.main.async {
-                textField.window?.makeFirstResponder(textField)
+                textView.window?.makeFirstResponder(textView)
+                textView.selectedRange = NSRange(location: textView.string.count, length: 0)
             }
         }
     }
@@ -463,79 +511,173 @@ struct OutlineTextField: NSViewRepresentable {
         Coordinator(self)
     }
 
-    final class Coordinator: NSObject, NSTextFieldDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: OutlineTextField
 
         init(_ parent: OutlineTextField) {
             self.parent = parent
         }
 
-        func controlTextDidBeginEditing(_ notification: Notification) {
+        func textDidBeginEditing(_ notification: Notification) {
             parent.editingItemID = parent.id
         }
 
-        func controlTextDidChange(_ notification: Notification) {
-            guard let textField = notification.object as? NSTextField else { return }
-            parent.text = textField.stringValue
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            parent.text = textView.string.replacingOccurrences(of: "\n", with: "")
         }
-    }
-}
 
-final class KeyHandlingTextField: NSTextField {
-    var onMoveUp: (() -> Void)?
-    var onMoveDown: (() -> Void)?
-    var onCreateRow: (() -> Void)?
-    var onIndent: (() -> Void)?
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == NSSelectorFromString("moveUp:") {
+                parent.onMoveUp()
+                return true
+            }
 
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: 34)
-    }
+            if commandSelector == NSSelectorFromString("moveDown:") {
+                parent.onMoveDown()
+                return true
+            }
 
-    override func becomeFirstResponder() -> Bool {
-        let didBecome = super.becomeFirstResponder()
-        if didBecome, let editor = currentEditor() {
-            editor.selectedRange = NSRange(location: stringValue.count, length: 0)
-        }
-        return didBecome
-    }
+            if commandSelector == NSSelectorFromString("insertTabIgnoringFieldEditor:")
+                || commandSelector == NSSelectorFromString("insertTab:") {
+                parent.onIndent()
+                return true
+            }
 
-    override func keyDown(with event: NSEvent) {
-        switch event.specialKey {
-        case .upArrow:
-            onMoveUp?()
-        case .downArrow:
-            onMoveDown?()
-        default:
-            if event.keyCode == 36 {
-                onCreateRow?()
-            } else if event.keyCode == 48 {
-                onIndent?()
-            } else {
-                super.keyDown(with: event)
+            if commandSelector == NSSelectorFromString("insertBacktabIgnoringFieldEditor:")
+                || commandSelector == NSSelectorFromString("insertBacktab:") {
+                parent.onOutdent()
+                return true
+            }
+
+            switch commandSelector {
+            case #selector(NSResponder.moveUp(_:)):
+                parent.onMoveUp()
+                return true
+            case #selector(NSResponder.moveDown(_:)):
+                parent.onMoveDown()
+                return true
+            case #selector(NSResponder.insertNewline(_:)):
+                parent.onCreateRow()
+                return true
+            case #selector(NSResponder.insertTab(_:)):
+                parent.onIndent()
+                return true
+            case #selector(NSResponder.insertBacktab(_:)):
+                parent.onOutdent()
+                return true
+            default:
+                return false
             }
         }
     }
 }
 
-final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
-    override func drawingRect(forBounds rect: NSRect) -> NSRect {
-        centeredRect(forBounds: rect)
+final class KeyHandlingTextView: NSTextView {
+    var onMoveUp: (() -> Void)?
+    var onMoveDown: (() -> Void)?
+    var onCreateRow: (() -> Void)?
+    var onIndent: (() -> Void)?
+    var onOutdent: (() -> Void)?
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: 34)
     }
 
-    override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
-        super.edit(withFrame: centeredRect(forBounds: rect), in: controlView, editor: textObj, delegate: delegate, event: event)
+    override func keyDown(with event: NSEvent) {
+        if isUpArrow(event) {
+            onMoveUp?()
+            return
+        }
+
+        if isDownArrow(event) {
+            onMoveDown?()
+            return
+        }
+
+        if event.keyCode == 36 {
+            onCreateRow?()
+        } else if isTab(event) {
+            handleTab(event)
+        } else {
+            super.keyDown(with: event)
+        }
     }
 
-    override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
-        super.select(withFrame: centeredRect(forBounds: rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
+    private func handleTab(_ event: NSEvent) {
+        if event.modifierFlags.contains(.shift) {
+            onOutdent?()
+        } else {
+            onIndent?()
+        }
     }
 
-    private func centeredRect(forBounds rect: NSRect) -> NSRect {
-        var drawingRect = super.drawingRect(forBounds: rect)
-        let textHeight = cellSize(forBounds: rect).height
-        drawingRect.origin.y = rect.origin.y + ((rect.height - textHeight) / 2)
-        drawingRect.size.height = textHeight
-        return drawingRect
+    private func isTab(_ event: NSEvent) -> Bool {
+        event.keyCode == 48 || event.charactersIgnoringModifiers == "\t"
+    }
+
+    private func isUpArrow(_ event: NSEvent) -> Bool {
+        event.specialKey == .upArrow || event.keyCode == 126
+    }
+
+    private func isDownArrow(_ event: NSEvent) -> Bool {
+        event.specialKey == .downArrow || event.keyCode == 125
+    }
+}
+
+struct RowKeyboardMonitor: NSViewRepresentable {
+    @Binding var editingItemID: UUID?
+    let onMoveUp: (UUID) -> Void
+    let onMoveDown: (UUID) -> Void
+
+    func makeNSView(context: Context) -> MonitorView {
+        let view = MonitorView()
+        view.install()
+        return view
+    }
+
+    func updateNSView(_ view: MonitorView, context: Context) {
+        view.editingItemID = editingItemID
+        view.onMoveUp = onMoveUp
+        view.onMoveDown = onMoveDown
+    }
+
+    final class MonitorView: NSView {
+        var editingItemID: UUID?
+        var onMoveUp: ((UUID) -> Void)?
+        var onMoveDown: ((UUID) -> Void)?
+        private var eventMonitor: Any?
+
+        deinit {
+            if let eventMonitor {
+                NSEvent.removeMonitor(eventMonitor)
+            }
+        }
+
+        func install() {
+            guard eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard
+                    let self,
+                    event.window === self.window,
+                    let editingItemID = self.editingItemID
+                else {
+                    return event
+                }
+
+                if event.specialKey == .upArrow || event.keyCode == 126 {
+                    self.onMoveUp?(editingItemID)
+                    return nil
+                }
+
+                if event.specialKey == .downArrow || event.keyCode == 125 {
+                    self.onMoveDown?(editingItemID)
+                    return nil
+                }
+
+                return event
+            }
+        }
     }
 }
 
