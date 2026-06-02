@@ -38,7 +38,7 @@ final class OutlineStore: ObservableObject {
 
     var visibleItems: [VisibleOutlineItem] {
         if let focusedItemID, let item = item(with: focusedItemID) {
-            return flatten([item], depth: 0)
+            return flatten(item.children, depth: 0)
         }
         return flatten(items, depth: 0)
     }
@@ -46,6 +46,11 @@ final class OutlineStore: ObservableObject {
     var breadcrumbs: [OutlineItem] {
         guard let focusedItemID else { return [] }
         return path(to: focusedItemID, in: items) ?? []
+    }
+
+    var focusedItem: OutlineItem? {
+        guard let focusedItemID else { return nil }
+        return item(with: focusedItemID)
     }
 
     func title(for id: UUID) -> String {
@@ -293,6 +298,13 @@ struct ContentView: View {
             Divider()
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
+                    if let focusedItem = store.focusedItem {
+                        Text(focusedItem.title.isEmpty ? "Untitled" : focusedItem.title)
+                            .font(.system(size: 18, weight: .semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 12)
+                    }
+
                     ForEach(store.visibleItems) { item in
                         OutlineRow(
                             item: item,
@@ -307,8 +319,7 @@ struct ContentView: View {
                                 store.toggleExpanded(item.id)
                             },
                             onFocus: {
-                                store.focus(item.id)
-                                editingItemID = item.id
+                                focusAndEditFirstVisible(item.id)
                             },
                             onAddChild: {
                                 let childID = store.addChild(to: item.id)
@@ -380,6 +391,7 @@ struct ContentView: View {
         HStack(spacing: 8) {
             Button {
                 store.focus(nil)
+                editingItemID = nil
             } label: {
                 Image(systemName: "house")
             }
@@ -392,8 +404,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
 
                 Button(item.title.isEmpty ? "Untitled" : item.title) {
-                    store.focus(item.id)
-                    editingItemID = item.id
+                    focusAndEditFirstVisible(item.id)
                 }
                 .buttonStyle(.plain)
             }
@@ -417,6 +428,11 @@ struct ContentView: View {
 
         editingItemID = previousID ?? nextID
         return true
+    }
+
+    private func focusAndEditFirstVisible(_ id: UUID) {
+        store.focus(id)
+        editingItemID = store.visibleItems.first?.id
     }
 }
 
@@ -442,7 +458,13 @@ struct OutlineRow: View {
             Color.clear
                 .frame(width: CGFloat(item.depth) * 28)
 
-            Button(action: onToggleExpanded) {
+            Button {
+                if NSEvent.modifierFlags.contains(.command) {
+                    onFocus()
+                } else {
+                    onToggleExpanded()
+                }
+            } label: {
                 Image(systemName: childCount == 0 ? "circle.fill" : isExpanded ? "chevron.down" : "chevron.right")
                     .font(.system(size: childCount == 0 ? 6 : 10))
                     .foregroundStyle(.secondary)
@@ -462,27 +484,42 @@ struct OutlineRow: View {
                 onCreateRow: onCreateRow,
                 onIndent: onIndent,
                 onOutdent: onOutdent,
-                onDeleteIfEmpty: onDeleteIfEmpty
+                onDeleteIfEmpty: onDeleteIfEmpty,
+                onCommandFocus: onFocus
             )
             .frame(height: 34)
 
             Spacer()
 
-            Button(action: onFocus) {
-                Image(systemName: "scope")
-            }
-            .buttonStyle(.borderless)
-            .help("Focus")
-
-            Button(action: onAddChild) {
-                Image(systemName: "plus")
-            }
-            .buttonStyle(.borderless)
-            .help("Add child")
+//            Button(action: onFocus) {
+//                Image(systemName: "scope")
+//            }
+//            .buttonStyle(.borderless)
+//            .help("Focus")
+//
+//            Button {
+//                if NSEvent.modifierFlags.contains(.command) {
+//                    onFocus()
+//                } else {
+//                    onAddChild()
+//                }
+//            } label: {
+//                Image(systemName: "plus")
+//            }
+//            .buttonStyle(.borderless)
+//            .help("Add child")
         }
         .frame(height: 15, alignment: .center)
         .padding(.vertical, 6)
         .padding(.horizontal, 8)
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                if NSEvent.modifierFlags.contains(.command) {
+                    onFocus()
+                }
+            }
+        )
     }
 }
 
@@ -496,6 +533,7 @@ struct OutlineTextField: NSViewRepresentable {
     let onIndent: () -> Void
     let onOutdent: () -> Void
     let onDeleteIfEmpty: () -> Bool
+    let onCommandFocus: () -> Void
 
     func makeNSView(context: Context) -> KeyHandlingTextView {
         let textView = KeyHandlingTextView()
@@ -517,6 +555,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onIndent = onIndent
         textView.onOutdent = onOutdent
         textView.onDeleteIfEmpty = onDeleteIfEmpty
+        textView.onCommandFocus = onCommandFocus
         return textView
     }
 
@@ -533,6 +572,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onIndent = onIndent
         textView.onOutdent = onOutdent
         textView.onDeleteIfEmpty = onDeleteIfEmpty
+        textView.onCommandFocus = onCommandFocus
         textView.delegate = context.coordinator
 
         let shouldEdit = editingItemID == id
@@ -618,9 +658,19 @@ final class KeyHandlingTextView: NSTextView {
     var onIndent: (() -> Void)?
     var onOutdent: (() -> Void)?
     var onDeleteIfEmpty: (() -> Bool)?
+    var onCommandFocus: (() -> Void)?
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: 34)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command) {
+            onCommandFocus?()
+            return
+        }
+
+        super.mouseDown(with: event)
     }
 
     override func keyDown(with event: NSEvent) {
