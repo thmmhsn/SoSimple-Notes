@@ -105,6 +105,18 @@ final class OutlineStore: ObservableObject {
         _ = outdent(id, in: &items)
     }
 
+    func removeIfEmpty(_ id: UUID) -> Bool {
+        guard title(for: id).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        if focusedItemID == id {
+            focusedItemID = nil
+        }
+
+        return remove(id, from: &items) != nil
+    }
+
     func toggleExpanded(_ id: UUID) {
         update(id) { item in
             item.isExpanded.toggle()
@@ -323,6 +335,9 @@ struct ContentView: View {
                             onOutdent: {
                                 store.outdent(item.id)
                                 editingItemID = item.id
+                            },
+                            onDeleteIfEmpty: {
+                                deleteIfEmpty(item.id)
                             }
                         )
                     }
@@ -343,6 +358,9 @@ struct ContentView: View {
                     if let nextID = store.nextVisibleItem(after: id) {
                         editingItemID = nextID
                     }
+                },
+                onDeleteIfEmpty: { id in
+                    deleteIfEmpty(id)
                 }
             )
             .frame(width: 0, height: 0)
@@ -385,6 +403,21 @@ struct ContentView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 14)
     }
+
+    private func deleteIfEmpty(_ id: UUID) -> Bool {
+        guard store.title(for: id).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        let previousID = store.previousVisibleItem(before: id)
+        let nextID = store.nextVisibleItem(after: id)
+        guard store.removeIfEmpty(id) else {
+            return false
+        }
+
+        editingItemID = previousID ?? nextID
+        return true
+    }
 }
 
 struct OutlineRow: View {
@@ -402,9 +435,10 @@ struct OutlineRow: View {
     let onCreateRow: () -> Void
     let onIndent: () -> Void
     let onOutdent: () -> Void
+    let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 0) {
             Color.clear
                 .frame(width: CGFloat(item.depth) * 28)
 
@@ -427,7 +461,8 @@ struct OutlineRow: View {
                 onMoveDown: onMoveDown,
                 onCreateRow: onCreateRow,
                 onIndent: onIndent,
-                onOutdent: onOutdent
+                onOutdent: onOutdent,
+                onDeleteIfEmpty: onDeleteIfEmpty
             )
             .frame(height: 34)
 
@@ -460,6 +495,7 @@ struct OutlineTextField: NSViewRepresentable {
     let onCreateRow: () -> Void
     let onIndent: () -> Void
     let onOutdent: () -> Void
+    let onDeleteIfEmpty: () -> Bool
 
     func makeNSView(context: Context) -> KeyHandlingTextView {
         let textView = KeyHandlingTextView()
@@ -480,6 +516,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onCreateRow = onCreateRow
         textView.onIndent = onIndent
         textView.onOutdent = onOutdent
+        textView.onDeleteIfEmpty = onDeleteIfEmpty
         return textView
     }
 
@@ -495,6 +532,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onCreateRow = onCreateRow
         textView.onIndent = onIndent
         textView.onOutdent = onOutdent
+        textView.onDeleteIfEmpty = onDeleteIfEmpty
         textView.delegate = context.coordinator
 
         let shouldEdit = editingItemID == id
@@ -579,6 +617,7 @@ final class KeyHandlingTextView: NSTextView {
     var onCreateRow: (() -> Void)?
     var onIndent: (() -> Void)?
     var onOutdent: (() -> Void)?
+    var onDeleteIfEmpty: (() -> Bool)?
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: 34)
@@ -593,6 +632,12 @@ final class KeyHandlingTextView: NSTextView {
         if isDownArrow(event) {
             onMoveDown?()
             return
+        }
+
+        if isDelete(event), string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if onDeleteIfEmpty?() == true {
+                return
+            }
         }
 
         if event.keyCode == 36 {
@@ -623,12 +668,17 @@ final class KeyHandlingTextView: NSTextView {
     private func isDownArrow(_ event: NSEvent) -> Bool {
         event.specialKey == .downArrow || event.keyCode == 125
     }
+
+    private func isDelete(_ event: NSEvent) -> Bool {
+        event.keyCode == 51 || event.keyCode == 117
+    }
 }
 
 struct RowKeyboardMonitor: NSViewRepresentable {
     @Binding var editingItemID: UUID?
     let onMoveUp: (UUID) -> Void
     let onMoveDown: (UUID) -> Void
+    let onDeleteIfEmpty: (UUID) -> Bool
 
     func makeNSView(context: Context) -> MonitorView {
         let view = MonitorView()
@@ -640,12 +690,14 @@ struct RowKeyboardMonitor: NSViewRepresentable {
         view.editingItemID = editingItemID
         view.onMoveUp = onMoveUp
         view.onMoveDown = onMoveDown
+        view.onDeleteIfEmpty = onDeleteIfEmpty
     }
 
     final class MonitorView: NSView {
         var editingItemID: UUID?
         var onMoveUp: ((UUID) -> Void)?
         var onMoveDown: ((UUID) -> Void)?
+        var onDeleteIfEmpty: ((UUID) -> Bool)?
         private var eventMonitor: Any?
 
         deinit {
@@ -673,6 +725,12 @@ struct RowKeyboardMonitor: NSViewRepresentable {
                 if event.specialKey == .downArrow || event.keyCode == 125 {
                     self.onMoveDown?(editingItemID)
                     return nil
+                }
+
+                if event.keyCode == 51 || event.keyCode == 117 {
+                    if self.onDeleteIfEmpty?(editingItemID) == true {
+                        return nil
+                    }
                 }
 
                 return event
