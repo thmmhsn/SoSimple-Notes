@@ -388,7 +388,7 @@ struct OutlineRow: View {
                 onCreateRow: onCreateRow,
                 onIndent: onIndent
             )
-            .frame(height: 24)
+            .frame(height: 34)
 
             Spacer()
 
@@ -404,7 +404,7 @@ struct OutlineRow: View {
             .buttonStyle(.borderless)
             .help("Add child")
         }
-        .frame(height: 32, alignment: .center)
+        .frame(height: 34, alignment: .center)
         .padding(.vertical, 6)
         .padding(.horizontal, 8)
     }
@@ -421,6 +421,7 @@ struct OutlineTextField: NSViewRepresentable {
 
     func makeNSView(context: Context) -> KeyHandlingTextField {
         let textField = KeyHandlingTextField()
+        textField.cell = VerticallyCenteredTextFieldCell()
         textField.isBordered = false
         textField.isBezeled = false
         textField.drawsBackground = false
@@ -487,7 +488,7 @@ final class KeyHandlingTextField: NSTextField {
     var onIndent: (() -> Void)?
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: 24)
+        NSSize(width: NSView.noIntrinsicMetric, height: 34)
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -513,6 +514,28 @@ final class KeyHandlingTextField: NSTextField {
                 super.keyDown(with: event)
             }
         }
+    }
+}
+
+final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        centeredRect(forBounds: rect)
+    }
+
+    override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
+        super.edit(withFrame: centeredRect(forBounds: rect), in: controlView, editor: textObj, delegate: delegate, event: event)
+    }
+
+    override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
+        super.select(withFrame: centeredRect(forBounds: rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
+    }
+
+    private func centeredRect(forBounds rect: NSRect) -> NSRect {
+        var drawingRect = super.drawingRect(forBounds: rect)
+        let textHeight = cellSize(forBounds: rect).height
+        drawingRect.origin.y = rect.origin.y + ((rect.height - textHeight) / 2)
+        drawingRect.size.height = textHeight
+        return drawingRect
     }
 }
 
