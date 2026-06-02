@@ -5,8 +5,8 @@
 //  Created by thameemh on 2-6-26.
 //
 
-import SwiftUI
 import Combine
+import SwiftUI
 
 struct OutlineItem: Identifiable, Codable, Equatable {
     var id = UUID()
@@ -261,7 +261,7 @@ struct ContentView: View {
             header
             Divider()
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 4) {
+                LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(store.visibleItems) { item in
                         OutlineRow(
                             item: item,
@@ -372,28 +372,23 @@ struct OutlineRow: View {
                 Image(systemName: childCount == 0 ? "circle.fill" : isExpanded ? "chevron.down" : "chevron.right")
                     .font(.system(size: childCount == 0 ? 6 : 10))
                     .foregroundStyle(.secondary)
-                    .frame(width: 18, height: 24)
+                    .bold()
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(childCount == 0)
-
-            TextField("New item", text: $title)
-                .textFieldStyle(.plain)
-                .font(.system(size: 16))
-                .focused($editingItemID, equals: item.id)
-                .onSubmit(onCreateRow)
-                .onKeyPress(.upArrow) {
-                    onMoveUp()
-                    return .handled
-                }
-                .onKeyPress(.downArrow) {
-                    onMoveDown()
-                    return .handled
-                }
-                .onKeyPress(.tab) {
-                    onIndent()
-                    return .handled
-                }
+            
+            OutlineTextField(
+                id: item.id,
+                text: $title,
+                editingItemID: $editingItemID,
+                onMoveUp: onMoveUp,
+                onMoveDown: onMoveDown,
+                onCreateRow: onCreateRow,
+                onIndent: onIndent
+            )
+            .frame(height: 24)
 
             Spacer()
 
@@ -409,8 +404,115 @@ struct OutlineRow: View {
             .buttonStyle(.borderless)
             .help("Add child")
         }
+        .frame(height: 32, alignment: .center)
         .padding(.vertical, 6)
         .padding(.horizontal, 8)
+    }
+}
+
+struct OutlineTextField: NSViewRepresentable {
+    let id: UUID
+    @Binding var text: String
+    @FocusState.Binding var editingItemID: UUID?
+    let onMoveUp: () -> Void
+    let onMoveDown: () -> Void
+    let onCreateRow: () -> Void
+    let onIndent: () -> Void
+
+    func makeNSView(context: Context) -> KeyHandlingTextField {
+        let textField = KeyHandlingTextField()
+        textField.isBordered = false
+        textField.isBezeled = false
+        textField.drawsBackground = false
+        textField.focusRingType = .none
+        textField.font = .systemFont(ofSize: 16)
+        textField.lineBreakMode = .byTruncatingTail
+        textField.cell?.wraps = false
+        textField.cell?.usesSingleLineMode = true
+        textField.delegate = context.coordinator
+        textField.onMoveUp = onMoveUp
+        textField.onMoveDown = onMoveDown
+        textField.onCreateRow = onCreateRow
+        textField.onIndent = onIndent
+        return textField
+    }
+
+    func updateNSView(_ textField: KeyHandlingTextField, context: Context) {
+        context.coordinator.parent = self
+
+        if textField.stringValue != text {
+            textField.stringValue = text
+        }
+
+        textField.onMoveUp = onMoveUp
+        textField.onMoveDown = onMoveDown
+        textField.onCreateRow = onCreateRow
+        textField.onIndent = onIndent
+
+        let shouldEdit = editingItemID == id
+        let isFirstResponder = textField.window?.firstResponder === textField.currentEditor()
+        if shouldEdit, !isFirstResponder {
+            DispatchQueue.main.async {
+                textField.window?.makeFirstResponder(textField)
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: OutlineTextField
+
+        init(_ parent: OutlineTextField) {
+            self.parent = parent
+        }
+
+        func controlTextDidBeginEditing(_ notification: Notification) {
+            parent.editingItemID = parent.id
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let textField = notification.object as? NSTextField else { return }
+            parent.text = textField.stringValue
+        }
+    }
+}
+
+final class KeyHandlingTextField: NSTextField {
+    var onMoveUp: (() -> Void)?
+    var onMoveDown: (() -> Void)?
+    var onCreateRow: (() -> Void)?
+    var onIndent: (() -> Void)?
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: 24)
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let didBecome = super.becomeFirstResponder()
+        if didBecome, let editor = currentEditor() {
+            editor.selectedRange = NSRange(location: stringValue.count, length: 0)
+        }
+        return didBecome
+    }
+
+    override func keyDown(with event: NSEvent) {
+        switch event.specialKey {
+        case .upArrow:
+            onMoveUp?()
+        case .downArrow:
+            onMoveDown?()
+        default:
+            if event.keyCode == 36 {
+                onCreateRow?()
+            } else if event.keyCode == 48 {
+                onIndent?()
+            } else {
+                super.keyDown(with: event)
+            }
+        }
     }
 }
 
