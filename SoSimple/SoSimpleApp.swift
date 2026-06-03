@@ -33,6 +33,11 @@ struct SoSimpleApp: App {
                 }
                 .keyboardShortcut("\\", modifiers: [.command, .shift])
 
+                Button("Toggle Pins Sidebar") {
+                    NotificationCenter.default.post(name: .toggleWorkspacePinnedSidebar, object: nil)
+                }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+
                 Button("Toggle Tasks Sidebar") {
                     NotificationCenter.default.post(name: .toggleWorkspaceTaskSidebar, object: nil)
                 }

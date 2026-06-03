@@ -42,6 +42,7 @@ struct OutlineItem: Identifiable, Codable, Equatable {
     var title: String
     var isExpanded = true
     var isComplete = false
+    var isPinned = false
     var tags: [String] = []
     var children: [OutlineItem] = []
 
@@ -50,6 +51,7 @@ struct OutlineItem: Identifiable, Codable, Equatable {
         title: String,
         isExpanded: Bool = true,
         isComplete: Bool = false,
+        isPinned: Bool = false,
         tags: [String] = [],
         children: [OutlineItem] = []
     ) {
@@ -57,6 +59,7 @@ struct OutlineItem: Identifiable, Codable, Equatable {
         self.title = title
         self.isExpanded = isExpanded
         self.isComplete = isComplete
+        self.isPinned = isPinned
         self.tags = tags
         self.children = children
     }
@@ -66,6 +69,7 @@ struct OutlineItem: Identifiable, Codable, Equatable {
         case title
         case isExpanded
         case isComplete
+        case isPinned
         case tags
         case children
     }
@@ -76,6 +80,7 @@ struct OutlineItem: Identifiable, Codable, Equatable {
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
         isExpanded = try container.decodeIfPresent(Bool.self, forKey: .isExpanded) ?? true
         isComplete = try container.decodeIfPresent(Bool.self, forKey: .isComplete) ?? false
+        isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
         children = try container.decodeIfPresent([OutlineItem].self, forKey: .children) ?? []
     }
@@ -226,6 +231,10 @@ final class OutlineStore: ObservableObject {
         return taskBucket(for: tag)?.id
     }
 
+    func pinnedItems() -> [TaggedOutlineItem] {
+        pinnedItems(in: items, path: [], inheritedProjectTitle: nil)
+    }
+
     func setTitle(_ title: String, for id: UUID) {
         update(id) { item in
             item.title = title
@@ -258,6 +267,10 @@ final class OutlineStore: ObservableObject {
 
     func isComplete(_ id: UUID) -> Bool {
         item(with: id)?.isComplete ?? false
+    }
+
+    func isPinned(_ id: UUID) -> Bool {
+        item(with: id)?.isPinned ?? false
     }
 
     func childCount(for id: UUID) -> Int {
@@ -335,6 +348,12 @@ final class OutlineStore: ObservableObject {
     func toggleComplete(_ id: UUID) {
         update(id) { item in
             item.isComplete.toggle()
+        }
+    }
+
+    func togglePinned(_ id: UUID) {
+        update(id) { item in
+            item.isPinned.toggle()
         }
     }
 
@@ -556,6 +575,28 @@ final class OutlineStore: ObservableObject {
                 )
             ]
             rows.append(contentsOf: taskItems(in: item.children, path: currentPath, inheritedProjectTitle: currentProjectTitle))
+            return rows
+        }
+    }
+
+    private func pinnedItems(in source: [OutlineItem], path: [String], inheritedProjectTitle: String?) -> [TaggedOutlineItem] {
+        source.flatMap { item -> [TaggedOutlineItem] in
+            let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayTitle = title.isEmpty ? "Untitled" : title
+            let currentPath = path + [displayTitle]
+            let currentProjectTitle = projectTitle(in: title) ?? inheritedProjectTitle
+            var rows: [TaggedOutlineItem] = item.isPinned
+                ? [
+                    TaggedOutlineItem(
+                        id: item.id,
+                        title: displayTitle,
+                        tags: parsedTags(in: title),
+                        path: path,
+                        projectTitle: currentProjectTitle
+                    )
+                ]
+                : []
+            rows.append(contentsOf: pinnedItems(in: item.children, path: currentPath, inheritedProjectTitle: currentProjectTitle))
             return rows
         }
     }
@@ -796,6 +837,7 @@ struct ContentView: View {
                                 isExpanded: !collapsedItemIDs.contains(item.id),
                                 childCount: store.childCount(for: item.id),
                                 isComplete: store.isComplete(item.id),
+                                isPinned: store.isPinned(item.id),
                                 isSelected: selectedItemIDs.contains(item.id),
                                 editingItemID: $editingItemID,
                                 onToggleExpanded: {
@@ -839,6 +881,9 @@ struct ContentView: View {
                                 },
                                 onToggleComplete: {
                                     store.toggleComplete(item.id)
+                                },
+                                onTogglePinned: {
+                                    store.togglePinned(item.id)
                                 },
                                 onDeleteIfEmpty: {
                                     deleteIfEmpty(item.id)
@@ -1074,12 +1119,23 @@ struct ContentView: View {
 struct WorkspaceView: View {
     @ObservedObject var store: OutlineStore
     @State private var isSplitViewEnabled = false
+    @State private var isPinnedSidebarEnabled = true
     @State private var isTaskSidebarEnabled = true
     @State private var selectedSidebarTag: String?
     @State private var mainFocusRequest: UUID?
 
     var body: some View {
         HSplitView {
+            if isPinnedSidebarEnabled {
+                PinnedSidebar(
+                    store: store,
+                    onOpenItem: { id in
+                        mainFocusRequest = id
+                    }
+                )
+                .frame(minWidth: 220, idealWidth: 240, maxWidth: 280)
+            }
+
             Group {
                 if isSplitViewEnabled {
                     HSplitView {
@@ -1113,13 +1169,26 @@ struct WorkspaceView: View {
                 onToggleSplitView: {
                     isSplitViewEnabled.toggle()
                 },
+                onTogglePinnedSidebar: {
+                    isPinnedSidebarEnabled.toggle()
+                },
                 onToggleTaskSidebar: {
                     isTaskSidebarEnabled.toggle()
                 }
             )
         )
-        .frame(minWidth: 720, minHeight: 520)
+        .frame(minWidth: 920, minHeight: 520)
         .toolbar {
+            Button {
+                isPinnedSidebarEnabled.toggle()
+            } label: {
+                Label(
+                    isPinnedSidebarEnabled ? "Hide Pins" : "Show Pins",
+                    systemImage: "pin"
+                )
+            }
+            .help(isPinnedSidebarEnabled ? "Hide Pins" : "Show Pins")
+
             Button {
                 isTaskSidebarEnabled.toggle()
             } label: {
@@ -1139,6 +1208,94 @@ struct WorkspaceView: View {
                 )
             }
             .help(isSplitViewEnabled ? "Close Split View" : "Open Split View")
+        }
+    }
+}
+
+struct PinnedSidebar: View {
+    @ObservedObject var store: OutlineStore
+    let onOpenItem: (UUID) -> Void
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                Text("Pinned")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 14)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(items) { item in
+                        PinnedNoteRow(
+                            item: item,
+                            title: store.title(for: item.id),
+                            isComplete: store.isComplete(item.id),
+                            onOpen: {
+                                onOpenItem(item.id)
+                            }
+                        )
+                    }
+                }
+                .padding(14)
+            }
+        }
+        .background(colorScheme == .dark ? Color(red: 0.075, green: 0.075, blue: 0.085) : Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var items: [TaggedOutlineItem] {
+        store.pinnedItems()
+    }
+}
+
+struct PinnedNoteRow: View {
+    let item: TaggedOutlineItem
+    let title: String
+    let isComplete: Bool
+    let onOpen: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 0) {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 26, height: 20)
+
+                Text(styledInlineTagText(title, isComplete: isComplete))
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
+            }
+
+            if let projectTitle = item.projectTitle {
+                Text(projectTitle)
+                    .fontWeight(.semibold)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.gray.opacity(0.7))
+                    .lineLimit(2)
+                    .padding(.leading, 26)
+                    .padding(.top, 1)
+            }
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onOpen)
+        .onHover { isHovering in
+            if isHovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
         }
     }
 }
@@ -1339,6 +1496,7 @@ struct OutlineRow: View {
     let isExpanded: Bool
     let childCount: Int
     let isComplete: Bool
+    let isPinned: Bool
     let isSelected: Bool
     @Binding var editingItemID: UUID?
 
@@ -1352,6 +1510,7 @@ struct OutlineRow: View {
     let onIndent: () -> Void
     let onOutdent: () -> Void
     let onToggleComplete: () -> Void
+    let onTogglePinned: () -> Void
     let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
@@ -1396,6 +1555,19 @@ struct OutlineRow: View {
                 )
                 .frame(height: 34)
                 .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
+
+                Button {
+                    onRowInteraction()
+                    onTogglePinned()
+                } label: {
+                    Image(systemName: isPinned ? "pin.fill" : "pin")
+                        .font(.system(size: 13))
+                        .foregroundStyle(isPinned ? Color.accentColor : Color.secondary.opacity(0.45))
+                        .frame(width: 28, height: 34)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isPinned ? "Unpin note" : "Pin note")
             }
 
 //            Button(action: onFocus) {
@@ -2008,11 +2180,13 @@ struct WindowTabConfigurator: NSViewRepresentable {
 
 struct WorkspaceCommandReceiver: NSViewRepresentable {
     let onToggleSplitView: () -> Void
+    let onTogglePinnedSidebar: () -> Void
     let onToggleTaskSidebar: () -> Void
 
     func makeNSView(context: Context) -> ReceiverView {
         let view = ReceiverView()
         view.onToggleSplitView = onToggleSplitView
+        view.onTogglePinnedSidebar = onTogglePinnedSidebar
         view.onToggleTaskSidebar = onToggleTaskSidebar
         view.install()
         return view
@@ -2020,11 +2194,13 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
 
     func updateNSView(_ view: ReceiverView, context: Context) {
         view.onToggleSplitView = onToggleSplitView
+        view.onTogglePinnedSidebar = onTogglePinnedSidebar
         view.onToggleTaskSidebar = onToggleTaskSidebar
     }
 
     final class ReceiverView: NSView {
         var onToggleSplitView: (() -> Void)?
+        var onTogglePinnedSidebar: (() -> Void)?
         var onToggleTaskSidebar: (() -> Void)?
         private var observers: [NSObjectProtocol] = []
 
@@ -2046,6 +2222,15 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
             })
 
             observers.append(NotificationCenter.default.addObserver(
+                forName: .toggleWorkspacePinnedSidebar,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, self.isActiveWindow else { return }
+                self.onTogglePinnedSidebar?()
+            })
+
+            observers.append(NotificationCenter.default.addObserver(
                 forName: .toggleWorkspaceTaskSidebar,
                 object: nil,
                 queue: .main
@@ -2063,6 +2248,7 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
 
 extension Notification.Name {
     static let toggleWorkspaceSplitView = Notification.Name("SoSimpleToggleWorkspaceSplitView")
+    static let toggleWorkspacePinnedSidebar = Notification.Name("SoSimpleToggleWorkspacePinnedSidebar")
     static let toggleWorkspaceTaskSidebar = Notification.Name("SoSimpleToggleWorkspaceTaskSidebar")
 }
 
