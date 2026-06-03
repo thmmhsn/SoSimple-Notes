@@ -8,6 +8,32 @@
 import Combine
 import SwiftUI
 
+private let supportedTags = ["i", "l"]
+private let hashtagRegex = try? NSRegularExpression(pattern: #"(?<!\S)#([A-Za-z0-9_-]+)"#)
+
+private func hashtagMatches(in title: String) -> [NSTextCheckingResult] {
+    guard let hashtagRegex else { return [] }
+    let text = title as NSString
+    return hashtagRegex.matches(in: title, range: NSRange(location: 0, length: text.length))
+}
+
+private func tagTextColor(for tag: String, isComplete: Bool) -> NSColor {
+    let palette: [NSColor] = [
+        NSColor.systemBlue,
+        NSColor.systemGreen,
+        NSColor.systemOrange,
+        NSColor.systemPink,
+        NSColor.systemPurple,
+        NSColor.systemTeal,
+        NSColor.systemYellow,
+        NSColor.systemIndigo
+    ]
+    let hash = tag.lowercased().unicodeScalars.reduce(0) { partialResult, scalar in
+        (partialResult &* 31 &+ Int(scalar.value)) & 0x7fffffff
+    }
+    return palette[hash % palette.count].withAlphaComponent(isComplete ? 0.72 : 1)
+}
+
 struct OutlineItem: Identifiable, Codable, Equatable {
     var id = UUID()
     var title: String
@@ -62,17 +88,7 @@ struct TaggedOutlineItem: Identifiable {
     let title: String
     let tags: [String]
     let path: [String]
-}
-
-struct ActiveTagInput: Equatable {
-    let itemID: UUID
-    let query: String
-    let rangeLocation: Int
-    let rangeLength: Int
-
-    var range: NSRange {
-        NSRange(location: rangeLocation, length: rangeLength)
-    }
+    let projectTitle: String?
 }
 
 private struct RowFramePreferenceKey: PreferenceKey {
@@ -144,13 +160,11 @@ final class OutlineStore: ObservableObject {
     }
 
     func allTags() -> [String] {
-        var tags = Set<String>()
-        collectTags(from: items, into: &tags)
-        return tags.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        supportedTags
     }
 
     func taggedItems(filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
-        taggedItems(in: items, path: [], filteredBy: selectedTag)
+        taggedItems(in: items, path: [], inheritedProjectTitle: nil, filteredBy: selectedTag)
     }
 
     func setTitle(_ title: String, for id: UUID) {
@@ -161,7 +175,9 @@ final class OutlineStore: ObservableObject {
 
     func addTag(_ rawTag: String, to id: UUID) {
         guard let tag = normalizedTag(rawTag) else { return }
-        let resolvedTag = allTags().first { $0.compare(tag, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame } ?? tag
+        guard let resolvedTag = allTags().first(where: { $0.compare(tag, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }) else {
+            return
+        }
 
         update(id) { item in
             guard !parsedTags(in: item.title).contains(where: { $0.compare(resolvedTag, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }) else {
@@ -411,22 +427,35 @@ final class OutlineStore: ObservableObject {
         }
     }
 
-    private func taggedItems(in source: [OutlineItem], path: [String], filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
+    private func taggedItems(in source: [OutlineItem], path: [String], inheritedProjectTitle: String?, filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
         source.flatMap { item -> [TaggedOutlineItem] in
             let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
             let tags = parsedTags(in: title)
             let currentPath = path + [title.isEmpty ? "Untitled" : title]
+            let currentProjectTitle = projectTitle(in: title) ?? inheritedProjectTitle
             let isIncluded = !tags.isEmpty && (
                 selectedTag == nil ||
                 tags.contains { $0.compare(selectedTag ?? "", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
             )
 
             var rows: [TaggedOutlineItem] = isIncluded
-                ? [TaggedOutlineItem(id: item.id, title: title.isEmpty ? "Untitled" : title, tags: tags, path: path)]
+                ? [TaggedOutlineItem(id: item.id, title: title.isEmpty ? "Untitled" : title, tags: tags, path: path, projectTitle: currentProjectTitle)]
                 : []
-            rows.append(contentsOf: taggedItems(in: item.children, path: currentPath, filteredBy: selectedTag))
+            rows.append(contentsOf: taggedItems(in: item.children, path: currentPath, inheritedProjectTitle: currentProjectTitle, filteredBy: selectedTag))
             return rows
         }
+    }
+
+    private func projectTitle(in title: String) -> String? {
+        guard title.contains("~") else { return nil }
+        var cleaned = title.replacingOccurrences(of: "~", with: " ")
+        for match in hashtagMatches(in: title).reversed() {
+            cleaned = (cleaned as NSString).replacingCharacters(in: match.range, with: " ")
+        }
+        let projectTitle = cleaned
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return projectTitle.isEmpty ? nil : projectTitle
     }
 
     private func normalizedTag(_ rawTag: String) -> String? {
@@ -453,18 +482,16 @@ final class OutlineStore: ObservableObject {
     }
 
     private func parsedTags(in title: String) -> [String] {
-        let pattern = #"(?<!\S)#([A-Za-z0-9_-]+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let text = title as NSString
-        let matches = regex.matches(in: title, range: NSRange(location: 0, length: text.length))
         var seen = Set<String>()
-        return matches.compactMap { match in
+        return hashtagMatches(in: title).compactMap { match in
             guard match.numberOfRanges > 1 else { return nil }
             let tag = text.substring(with: match.range(at: 1))
             let key = tag.lowercased()
+            guard supportedTags.contains(key) else { return nil }
             guard !seen.contains(key) else { return nil }
             seen.insert(key)
-            return tag
+            return key
         }
     }
 
@@ -530,7 +557,6 @@ struct ContentView: View {
     @State private var focusedItemID: UUID?
     @State private var collapsedItemIDs = Set<UUID>()
     @State private var selectedItemIDs = Set<UUID>()
-    @State private var activeTagInput: ActiveTagInput?
     @State private var rowFrames: [UUID: CGRect] = [:]
     @State private var selectionDragStart: CGPoint?
     @State private var selectionDragCurrent: CGPoint?
@@ -644,9 +670,6 @@ struct ContentView: View {
                                 isExpanded: !collapsedItemIDs.contains(item.id),
                                 childCount: store.childCount(for: item.id),
                                 isComplete: store.isComplete(item.id),
-                                currentTags: store.tags(for: item.id),
-                                availableTags: store.allTags(),
-                                activeTagInput: activeTagInput?.itemID == item.id ? activeTagInput : nil,
                                 isSelected: selectedItemIDs.contains(item.id),
                                 editingItemID: $editingItemID,
                                 onToggleExpanded: {
@@ -690,12 +713,6 @@ struct ContentView: View {
                                 },
                                 onToggleComplete: {
                                     store.toggleComplete(item.id)
-                                },
-                                onTagInputChanged: { query, range in
-                                    updateTagInput(itemID: item.id, query: query, range: range)
-                                },
-                                onApplyTag: { tag in
-                                    applyTag(tag, to: item.id)
                                 },
                                 onDeleteIfEmpty: {
                                     deleteIfEmpty(item.id)
@@ -751,7 +768,6 @@ struct ContentView: View {
                 focusedItemID = nil
                 editingItemID = nil
                 selectedItemIDs = []
-                activeTagInput = nil
             } label: {
                 Image(systemName: "house")
             }
@@ -797,7 +813,6 @@ struct ContentView: View {
     private func focusAndEditFirstVisible(_ id: UUID) {
         isFocusedTitleEditing = false
         selectedItemIDs = []
-        activeTagInput = nil
         focusedItemID = id
         editingItemID = visibleItems.first?.id
     }
@@ -836,7 +851,6 @@ struct ContentView: View {
             selectionDragStart = location
             editingItemID = nil
             isFocusedTitleEditing = false
-            activeTagInput = nil
         }
 
         selectionDragCurrent = location
@@ -863,40 +877,6 @@ struct ContentView: View {
         } else {
             collapsedItemIDs.insert(id)
         }
-    }
-
-    private func updateTagInput(itemID: UUID, query: String?, range: NSRange?) {
-        guard let query, let range else {
-            if activeTagInput?.itemID == itemID {
-                activeTagInput = nil
-            }
-            return
-        }
-
-        activeTagInput = ActiveTagInput(
-            itemID: itemID,
-            query: query,
-            rangeLocation: range.location,
-            rangeLength: range.length
-        )
-    }
-
-    private func applyTag(_ tag: String, to itemID: UUID) {
-        guard let activeTagInput, activeTagInput.itemID == itemID else {
-            activeTagInput = nil
-            editingItemID = itemID
-            return
-        }
-
-        let title = store.title(for: itemID)
-        let text = title as NSString
-        if NSMaxRange(activeTagInput.range) <= text.length {
-            let updatedTitle = text.replacingCharacters(in: activeTagInput.range, with: "#\(tag)")
-            store.setTitle(updatedTitle, for: itemID)
-        }
-
-        self.activeTagInput = nil
-        editingItemID = itemID
     }
 
     private func nextVisibleItem(after id: UUID) -> UUID? {
@@ -980,9 +960,8 @@ struct WorkspaceView: View {
 
             if isTaskSidebarEnabled {
                 TagSidebar(
-                    tags: store.allTags(),
-                    selectedTag: $selectedSidebarTag,
-                    items: store.taggedItems(filteredBy: selectedSidebarTag)
+                    store: store,
+                    selectedTag: $selectedSidebarTag
                 )
                 .frame(minWidth: 220, idealWidth: 260, maxWidth: 340)
             }
@@ -1018,22 +997,19 @@ struct WorkspaceView: View {
 }
 
 struct TagSidebar: View {
-    let tags: [String]
+    @ObservedObject var store: OutlineStore
     @Binding var selectedTag: String?
-    let items: [TaggedOutlineItem]
+    @State private var paneID = UUID()
+    @State private var editingItemID: UUID?
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    FilterChip(title: "All", isSelected: selectedTag == nil) {
-                        selectedTag = nil
-                    }
-
-                    ForEach(tags, id: \.self) { tag in
-                        FilterChip(title: "#\(tag)", isSelected: selectedTag == tag) {
-                            selectedTag = selectedTag == tag ? nil : tag
+                    ForEach(filterOptions, id: \.tag) { option in
+                        FilterChip(title: option.title, isSelected: selectedTag == option.tag) {
+                            selectedTag = option.tag
                         }
                     }
                 }
@@ -1046,13 +1022,89 @@ struct TagSidebar: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     ForEach(items) { item in
-                        TaggedTodoRow(item: item)
+                        TaggedTodoRow(
+                            paneID: paneID,
+                            item: item,
+                            title: Binding(
+                                get: { store.title(for: item.id) },
+                                set: { store.setTitle($0, for: item.id) }
+                            ),
+                            isComplete: store.isComplete(item.id),
+                            editingItemID: $editingItemID,
+                            onMoveUp: {
+                                if let previousID = previousItem(before: item.id) {
+                                    editingItemID = previousID
+                                }
+                            },
+                            onMoveDown: {
+                                if let nextID = nextItem(after: item.id) {
+                                    editingItemID = nextID
+                                }
+                            },
+                            onToggleComplete: {
+                                store.toggleComplete(item.id)
+                            },
+                            onDeleteIfEmpty: {
+                                deleteIfEmpty(item.id)
+                            }
+                        )
                     }
                 }
-                .padding(10)
+                .padding(14)
             }
         }
         .background(colorScheme == .dark ? Color(red: 0.075, green: 0.075, blue: 0.085) : Color(nsColor: .controlBackgroundColor))
+        .onAppear {
+            if selectedTag == nil {
+                selectedTag = "i"
+            }
+        }
+    }
+
+    private var tags: [String] {
+        store.allTags()
+    }
+
+    private var filterOptions: [(title: String, tag: String)] {
+        [
+            ("Inbox", "i"),
+            ("Later", "l")
+        ]
+    }
+
+    private var items: [TaggedOutlineItem] {
+        store.taggedItems(filteredBy: selectedTag)
+    }
+
+    private func deleteIfEmpty(_ id: UUID) -> Bool {
+        guard store.title(for: id).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        let previousID = previousItem(before: id)
+        let nextID = nextItem(after: id)
+        guard store.removeIfEmpty(id) else {
+            return false
+        }
+
+        editingItemID = previousID ?? nextID
+        return true
+    }
+
+    private func nextItem(after id: UUID) -> UUID? {
+        let ids = items.map(\.id)
+        guard let index = ids.firstIndex(of: id), index < ids.index(before: ids.endIndex) else {
+            return nil
+        }
+        return ids[ids.index(after: index)]
+    }
+
+    private func previousItem(before id: UUID) -> UUID? {
+        let ids = items.map(\.id)
+        guard let index = ids.firstIndex(of: id), index > ids.startIndex else {
+            return nil
+        }
+        return ids[ids.index(before: index)]
     }
 }
 
@@ -1076,23 +1128,59 @@ struct FilterChip: View {
 }
 
 struct TaggedTodoRow: View {
+    let paneID: UUID
     let item: TaggedOutlineItem
+    @Binding var title: String
+    let isComplete: Bool
+    @Binding var editingItemID: UUID?
+
+    let onMoveUp: () -> Void
+    let onMoveDown: () -> Void
+    let onToggleComplete: () -> Void
+    let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 0) {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 6))
                     .foregroundStyle(.secondary)
-                Text(item.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(2)
+                    .frame(width: 34, height: 34)
+
+                OutlineTextField(
+                    paneID: paneID,
+                    id: item.id,
+                    text: $title,
+                    editingItemID: $editingItemID,
+                    onMoveUp: onMoveUp,
+                    onMoveDown: onMoveDown,
+                    onCreateRow: {},
+                    onIndent: {},
+                    onOutdent: {},
+                    onToggleComplete: onToggleComplete,
+                    onDeleteIfEmpty: onDeleteIfEmpty,
+                    onCommandFocus: {},
+                    onBeginEditing: {},
+                    wrapsText: true,
+                    isComplete: isComplete
+                )
+                .frame(minHeight: 34)
+                .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
             }
+
+            if let projectTitle = item.projectTitle {
+                Text(projectTitle)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .padding(.leading, 34)
+            }
+
         }
+        .padding(.vertical, 6)
         .padding(.horizontal, 8)
-        .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
     }
 }
 
@@ -1103,9 +1191,6 @@ struct OutlineRow: View {
     let isExpanded: Bool
     let childCount: Int
     let isComplete: Bool
-    let currentTags: [String]
-    let availableTags: [String]
-    let activeTagInput: ActiveTagInput?
     let isSelected: Bool
     @Binding var editingItemID: UUID?
 
@@ -1119,8 +1204,6 @@ struct OutlineRow: View {
     let onIndent: () -> Void
     let onOutdent: () -> Void
     let onToggleComplete: () -> Void
-    let onTagInputChanged: (String?, NSRange?) -> Void
-    let onApplyTag: (String) -> Void
     let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
@@ -1161,21 +1244,10 @@ struct OutlineRow: View {
                     onDeleteIfEmpty: onDeleteIfEmpty,
                     onCommandFocus: onFocus,
                     onBeginEditing: onRowInteraction,
-                    onTagInputChanged: onTagInputChanged,
                     isComplete: isComplete
                 )
                 .frame(height: 34)
                 .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
-            }
-
-            if let activeTagInput {
-                TagSuggestionMenu(
-                    query: activeTagInput.query,
-                    availableTags: availableTags,
-                    currentTags: currentTags,
-                    onSelect: onApplyTag
-                )
-                .padding(.leading, CGFloat(item.depth) * 28 + 42)
             }
 
 //            Button(action: onFocus) {
@@ -1214,110 +1286,6 @@ struct OutlineRow: View {
     }
 }
 
-struct TagText: View {
-    let tag: String
-    let onRemove: (() -> Void)?
-    @State private var isHovering = false
-
-    init(tag: String, onRemove: (() -> Void)? = nil) {
-        self.tag = tag
-        self.onRemove = onRemove
-    }
-
-    var body: some View {
-        Button {
-            onRemove?()
-        } label: {
-            HStack(spacing: 4) {
-                Text("#\(tag)")
-                    .font(.system(size: 13, weight: .semibold))
-                if isHovering, onRemove != nil {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
-                }
-            }
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-        }
-        .buttonStyle(.plain)
-        .help(onRemove == nil ? tag : "Remove \(tag)")
-        .onHover { isHovering = $0 }
-    }
-}
-
-struct TagSuggestionMenu: View {
-    let query: String
-    let availableTags: [String]
-    let currentTags: [String]
-    let onSelect: (String) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(suggestions, id: \.self) { tag in
-                Button {
-                    onSelect(tag)
-                } label: {
-                    HStack(spacing: 8) {
-                        TagText(tag: tag, onRemove: nil)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-
-            if let creatableTag {
-                Button {
-                    onSelect(creatableTag)
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(.secondary)
-                        TagText(tag: creatableTag, onRemove: nil)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(width: 190, alignment: .leading)
-        .padding(6)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.16), radius: 12, x: 0, y: 6)
-    }
-
-    private var suggestions: [String] {
-        availableTags.filter { tag in
-            !currentTags.contains { $0.compare(tag, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame } &&
-            (query.isEmpty || tag.localizedCaseInsensitiveContains(query))
-        }
-        .prefix(6)
-        .map(\.self)
-    }
-
-    private var creatableTag: String? {
-        let tag = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !tag.isEmpty else { return nil }
-        guard !currentTags.contains(where: { $0.compare(tag, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }) else {
-            return nil
-        }
-        guard !availableTags.contains(where: { $0.compare(tag, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }) else {
-            return nil
-        }
-        return tag
-    }
-}
-
 struct OutlineTextField: NSViewRepresentable {
     let paneID: UUID
     let id: UUID
@@ -1332,7 +1300,7 @@ struct OutlineTextField: NSViewRepresentable {
     let onDeleteIfEmpty: () -> Bool
     let onCommandFocus: () -> Void
     let onBeginEditing: () -> Void
-    let onTagInputChanged: (String?, NSRange?) -> Void
+    var wrapsText = false
     let isComplete: Bool
 
     func makeNSView(context: Context) -> KeyHandlingTextView {
@@ -1348,8 +1316,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.font = .systemFont(ofSize: 16)
         textView.textContainerInset = NSSize(width: 0, height: 7)
         textView.textContainer?.lineFragmentPadding = 0
-        textView.textContainer?.maximumNumberOfLines = 1
-        textView.textContainer?.lineBreakMode = .byTruncatingTail
+        configureWrapping(for: textView)
         textView.delegate = context.coordinator
         textView.onMoveUp = onMoveUp
         textView.onMoveDown = onMoveDown
@@ -1383,6 +1350,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onCommandFocus = onCommandFocus
         textView.onBeginEditing = onBeginEditing
         textView.delegate = context.coordinator
+        configureWrapping(for: textView)
         applyCompletionStyle(to: textView)
 
         let shouldEdit = editingItemID == id
@@ -1400,6 +1368,18 @@ struct OutlineTextField: NSViewRepresentable {
         Coordinator(self)
     }
 
+    private func configureWrapping(for textView: NSTextView) {
+        if let keyHandlingTextView = textView as? KeyHandlingTextView {
+            keyHandlingTextView.wrapsText = wrapsText
+        }
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = wrapsText
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.heightTracksTextView = !wrapsText
+        textView.textContainer?.maximumNumberOfLines = wrapsText ? 0 : 1
+        textView.textContainer?.lineBreakMode = wrapsText ? .byWordWrapping : .byTruncatingTail
+    }
+
     private func applyCompletionStyle(to textView: NSTextView) {
         let textColor = isComplete ? NSColor.secondaryLabelColor : NSColor.labelColor
         let attributes: [NSAttributedString.Key: Any] = [
@@ -1414,6 +1394,19 @@ struct OutlineTextField: NSViewRepresentable {
         let range = NSRange(location: 0, length: (textView.string as NSString).length)
         if range.length > 0 {
             textView.textStorage?.setAttributes(attributes, range: range)
+            let text = textView.string as NSString
+            for match in hashtagMatches(in: textView.string) {
+                guard match.numberOfRanges > 1 else { continue }
+                let tag = text.substring(with: match.range(at: 1))
+                guard supportedTags.contains(tag.lowercased()) else { continue }
+                textView.textStorage?.addAttributes(
+                    [
+                        .foregroundColor: tagTextColor(for: tag, isComplete: isComplete),
+                        .strikethroughColor: textColor
+                    ],
+                    range: match.range
+                )
+            }
         }
     }
 
@@ -1435,17 +1428,14 @@ struct OutlineTextField: NSViewRepresentable {
         func textDidBeginEditing(_ notification: Notification) {
             parent.onBeginEditing()
             parent.editingItemID = parent.id
-            updateTagInput(from: notification.object as? NSTextView)
         }
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string.replacingOccurrences(of: "\n", with: "")
-            updateTagInput(from: textView)
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
-            updateTagInput(from: notification.object as? NSTextView)
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -1492,47 +1482,6 @@ struct OutlineTextField: NSViewRepresentable {
             }
         }
 
-        private func updateTagInput(from textView: NSTextView?) {
-            guard let textView else {
-                parent.onTagInputChanged(nil, nil)
-                return
-            }
-
-            guard let token = hashtagToken(in: textView) else {
-                parent.onTagInputChanged(nil, nil)
-                return
-            }
-
-            parent.onTagInputChanged(token.query, token.range)
-        }
-
-        private func hashtagToken(in textView: NSTextView) -> (query: String, range: NSRange)? {
-            let text = textView.string as NSString
-            let cursor = min(textView.selectedRange().location, text.length)
-            var start = cursor
-
-            while start > 0 {
-                let scalar = text.character(at: start - 1)
-                if let unicodeScalar = UnicodeScalar(UInt32(scalar)),
-                   CharacterSet.whitespacesAndNewlines.contains(unicodeScalar) {
-                    break
-                }
-                start -= 1
-            }
-
-            let length = cursor - start
-            guard length > 0 else { return nil }
-            let tokenRange = NSRange(location: start, length: length)
-            let token = text.substring(with: tokenRange)
-            guard token.hasPrefix("#") else { return nil }
-
-            let query = String(token.dropFirst())
-            guard query.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) else {
-                return nil
-            }
-
-            return (query, tokenRange)
-        }
     }
 }
 
@@ -1664,6 +1613,7 @@ struct SelectionClearMouseMonitor: NSViewRepresentable {
 final class KeyHandlingTextView: NSTextView {
     var paneID: UUID?
     var representedItemID: UUID?
+    var wrapsText = false
     var onMoveUp: (() -> Void)?
     var onMoveDown: (() -> Void)?
     var onCreateRow: (() -> Void)?
@@ -1675,7 +1625,26 @@ final class KeyHandlingTextView: NSTextView {
     var onBeginEditing: (() -> Void)?
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: 34)
+        guard wrapsText, let textContainer, let layoutManager else {
+            return NSSize(width: NSView.noIntrinsicMetric, height: 34)
+        }
+
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        let height = ceil(usedRect.height + textContainerInset.height * 2)
+        return NSSize(width: NSView.noIntrinsicMetric, height: max(34, height))
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        invalidateIntrinsicContentSize()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        if wrapsText {
+            invalidateIntrinsicContentSize()
+        }
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
