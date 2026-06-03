@@ -9,6 +9,9 @@ import Combine
 import SwiftUI
 
 private let supportedTags = ["i", "l"]
+private let taskRootTitle = "Tasks"
+private let inboxTaskTitle = "Inbox"
+private let laterTaskTitle = "Later"
 private let hashtagRegex = try? NSRegularExpression(pattern: #"(?<!\S)#([A-Za-z0-9_-]+)"#)
 
 private func hashtagMatches(in title: String) -> [NSTextCheckingResult] {
@@ -91,6 +94,37 @@ struct TaggedOutlineItem: Identifiable {
     let projectTitle: String?
 }
 
+private func styledInlineTagText(_ title: String, isComplete: Bool) -> AttributedString {
+    var attributed = AttributedString(title.isEmpty ? "Untitled" : title)
+    attributed.font = .system(size: 16)
+    attributed.foregroundColor = isComplete ? .secondary : .primary
+    if isComplete {
+        attributed.strikethroughStyle = .single
+        attributed.strikethroughColor = NSColor.secondaryLabelColor
+    }
+
+    let source = attributed.characters
+    let plainText = String(source)
+    let nsText = plainText as NSString
+    for match in hashtagMatches(in: plainText) {
+        guard match.numberOfRanges > 1 else { continue }
+        let tag = nsText.substring(with: match.range(at: 1))
+        guard supportedTags.contains(tag.lowercased()) else { continue }
+        let startOffset = match.range.location
+        let endOffset = match.range.location + match.range.length
+        guard
+            let start = source.index(source.startIndex, offsetBy: startOffset, limitedBy: source.endIndex),
+            let end = source.index(source.startIndex, offsetBy: endOffset, limitedBy: source.endIndex)
+        else {
+            continue
+        }
+
+        attributed[start..<end].foregroundColor = Color(nsColor: tagTextColor(for: tag, isComplete: isComplete))
+    }
+
+    return attributed
+}
+
 private struct RowFramePreferenceKey: PreferenceKey {
     static var defaultValue: [UUID: CGRect] = [:]
 
@@ -128,6 +162,7 @@ final class OutlineStore: ObservableObject {
     init() {
         storageURL = Self.makeStorageURL()
         load()
+        ensureTaskBuckets()
     }
 
     func visibleItems(focusedItemID: UUID?) -> [VisibleOutlineItem] {
@@ -165,6 +200,25 @@ final class OutlineStore: ObservableObject {
 
     func taggedItems(filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
         taggedItems(in: items, path: [], inheritedProjectTitle: nil, filteredBy: selectedTag)
+    }
+
+    func taskItems(filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
+        let tag = selectedTag == "l" ? "l" : "i"
+        let bucketItems: [TaggedOutlineItem]
+        if let bucket = taskBucket(for: tag) {
+            bucketItems = taskItems(in: bucket.children, path: [bucket.title], inheritedProjectTitle: nil)
+        } else {
+            bucketItems = []
+        }
+
+        var seenIDs = Set(bucketItems.map(\.id))
+        let taggedItems = taggedItems(filteredBy: tag).filter { item in
+            guard !seenIDs.contains(item.id) else { return false }
+            seenIDs.insert(item.id)
+            return true
+        }
+
+        return bucketItems + taggedItems
     }
 
     func setTitle(_ title: String, for id: UUID) {
@@ -356,6 +410,41 @@ final class OutlineStore: ObservableObject {
         ]
     }
 
+    private func ensureTaskBuckets() {
+        if let taskIndex = items.firstIndex(where: { isTitle($0.title, equalTo: taskRootTitle) }) {
+            items[taskIndex].isExpanded = true
+            if !items[taskIndex].children.contains(where: { isTitle($0.title, equalTo: inboxTaskTitle) }) {
+                items[taskIndex].children.append(OutlineItem(title: inboxTaskTitle))
+            }
+            if !items[taskIndex].children.contains(where: { isTitle($0.title, equalTo: laterTaskTitle) }) {
+                items[taskIndex].children.append(OutlineItem(title: laterTaskTitle))
+            }
+        } else {
+            items.append(
+                OutlineItem(
+                    title: taskRootTitle,
+                    children: [
+                        OutlineItem(title: inboxTaskTitle),
+                        OutlineItem(title: laterTaskTitle)
+                    ]
+                )
+            )
+        }
+    }
+
+    private func taskBucket(for selectedTag: String?) -> OutlineItem? {
+        guard let taskRoot = items.first(where: { isTitle($0.title, equalTo: taskRootTitle) }) else {
+            return nil
+        }
+        let title = selectedTag == "l" ? laterTaskTitle : inboxTaskTitle
+        return taskRoot.children.first { isTitle($0.title, equalTo: title) }
+    }
+
+    private func isTitle(_ title: String, equalTo expectedTitle: String) -> Bool {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+            .compare(expectedTitle, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+    }
+
     private func item(with id: UUID) -> OutlineItem? {
         find(id, in: items)
     }
@@ -442,6 +531,26 @@ final class OutlineStore: ObservableObject {
                 ? [TaggedOutlineItem(id: item.id, title: title.isEmpty ? "Untitled" : title, tags: tags, path: path, projectTitle: currentProjectTitle)]
                 : []
             rows.append(contentsOf: taggedItems(in: item.children, path: currentPath, inheritedProjectTitle: currentProjectTitle, filteredBy: selectedTag))
+            return rows
+        }
+    }
+
+    private func taskItems(in source: [OutlineItem], path: [String], inheritedProjectTitle: String?) -> [TaggedOutlineItem] {
+        source.flatMap { item -> [TaggedOutlineItem] in
+            let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayTitle = title.isEmpty ? "Untitled" : title
+            let currentPath = path + [displayTitle]
+            let currentProjectTitle = projectTitle(in: title) ?? inheritedProjectTitle
+            var rows = [
+                TaggedOutlineItem(
+                    id: item.id,
+                    title: displayTitle,
+                    tags: [],
+                    path: path,
+                    projectTitle: currentProjectTitle
+                )
+            ]
+            rows.append(contentsOf: taskItems(in: item.children, path: currentPath, inheritedProjectTitle: currentProjectTitle))
             return rows
         }
     }
@@ -552,6 +661,7 @@ struct ContentView: View {
     @ObservedObject var store: OutlineStore
     let minimumWidth: CGFloat
     let updatesWindowTitle: Bool
+    @Binding private var focusRequest: UUID?
     @State private var paneID = UUID()
     @State private var editingItemID: UUID?
     @State private var focusedItemID: UUID?
@@ -565,10 +675,16 @@ struct ContentView: View {
     @FocusState private var isFocusedTitleEditing: Bool
     @Environment(\.colorScheme) private var colorScheme
 
-    init(store: OutlineStore, minimumWidth: CGFloat = 720, updatesWindowTitle: Bool = true) {
+    init(
+        store: OutlineStore,
+        minimumWidth: CGFloat = 720,
+        updatesWindowTitle: Bool = true,
+        focusRequest: Binding<UUID?> = .constant(nil)
+    ) {
         self.store = store
         self.minimumWidth = minimumWidth
         self.updatesWindowTitle = updatesWindowTitle
+        self._focusRequest = focusRequest
     }
 
     var body: some View {
@@ -623,6 +739,11 @@ struct ContentView: View {
             }
         } message: {
             Text("This will delete \(pendingDeleteItemIDs.count) selected notes and their sub-notes.")
+        }
+        .onChange(of: focusRequest) { _, requestedID in
+            guard let requestedID else { return }
+            focusItem(requestedID)
+            focusRequest = nil
         }
         .frame(minWidth: minimumWidth, minHeight: 520)
     }
@@ -817,6 +938,13 @@ struct ContentView: View {
         editingItemID = visibleItems.first?.id
     }
 
+    private func focusItem(_ id: UUID) {
+        isFocusedTitleEditing = false
+        selectedItemIDs = []
+        focusedItemID = id
+        editingItemID = nil
+    }
+
     private func addItemForCurrentView() {
         isFocusedTitleEditing = false
         if let focusedItemID {
@@ -941,29 +1069,38 @@ struct ContentView: View {
 struct WorkspaceView: View {
     @ObservedObject var store: OutlineStore
     @State private var isSplitViewEnabled = false
-    @State private var isTaskSidebarEnabled = false
+    @State private var isTaskSidebarEnabled = true
     @State private var selectedSidebarTag: String?
+    @State private var mainFocusRequest: UUID?
 
     var body: some View {
         HSplitView {
             Group {
                 if isSplitViewEnabled {
                     HSplitView {
-                        ContentView(store: store, minimumWidth: 320, updatesWindowTitle: false)
+                        ContentView(
+                            store: store,
+                            minimumWidth: 320,
+                            updatesWindowTitle: false,
+                            focusRequest: $mainFocusRequest
+                        )
                         ContentView(store: store, minimumWidth: 320, updatesWindowTitle: false)
                     }
                     .background(WindowTabConfigurator(title: "Split View"))
                 } else {
-                    ContentView(store: store)
+                    ContentView(store: store, focusRequest: $mainFocusRequest)
                 }
             }
 
             if isTaskSidebarEnabled {
                 TagSidebar(
                     store: store,
-                    selectedTag: $selectedSidebarTag
+                    selectedTag: $selectedSidebarTag,
+                    onOpenItem: { id in
+                        mainFocusRequest = id
+                    }
                 )
-                .frame(minWidth: 220, idealWidth: 260, maxWidth: 340)
+                .frame(minWidth: 220, idealWidth: 340, maxWidth: 340)
             }
         }
         .background(
@@ -999,13 +1136,14 @@ struct WorkspaceView: View {
 struct TagSidebar: View {
     @ObservedObject var store: OutlineStore
     @Binding var selectedTag: String?
+    let onOpenItem: (UUID) -> Void
     @State private var paneID = UUID()
     @State private var editingItemID: UUID?
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
                 HStack(spacing: 8) {
                     ForEach(filterOptions, id: \.tag) { option in
                         FilterChip(title: option.title, isSelected: selectedTag == option.tag) {
@@ -1013,9 +1151,9 @@ struct TagSidebar: View {
                         }
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -1023,12 +1161,13 @@ struct TagSidebar: View {
                         TaggedTodoRow(
                             paneID: paneID,
                             item: item,
-                            title: Binding(
-                                get: { store.title(for: item.id) },
-                                set: { store.setTitle($0, for: item.id) }
-                            ),
+                            title: store.title(for: item.id),
                             isComplete: store.isComplete(item.id),
                             editingItemID: $editingItemID,
+                            onOpen: {
+                                editingItemID = nil
+                                onOpenItem(item.id)
+                            },
                             onMoveUp: {
                                 if let previousID = previousItem(before: item.id) {
                                     editingItemID = previousID
@@ -1071,7 +1210,7 @@ struct TagSidebar: View {
     }
 
     private var items: [TaggedOutlineItem] {
-        store.taggedItems(filteredBy: selectedTag)
+        store.taskItems(filteredBy: selectedTag)
     }
 
     private func deleteIfEmpty(_ id: UUID) -> Bool {
@@ -1128,10 +1267,11 @@ struct FilterChip: View {
 struct TaggedTodoRow: View {
     let paneID: UUID
     let item: TaggedOutlineItem
-    @Binding var title: String
+    let title: String
     let isComplete: Bool
     @Binding var editingItemID: UUID?
 
+    let onOpen: () -> Void
     let onMoveUp: () -> Void
     let onMoveDown: () -> Void
     let onToggleComplete: () -> Void
@@ -1143,44 +1283,37 @@ struct TaggedTodoRow: View {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 6))
                     .foregroundStyle(.secondary)
-                    .frame(width: 34, height: 34)
+                    .frame(width: 34, height: 20)
 
-                OutlineTextField(
-                    paneID: paneID,
-                    id: item.id,
-                    text: $title,
-                    editingItemID: $editingItemID,
-                    onMoveUp: onMoveUp,
-                    onMoveDown: onMoveDown,
-                    onCreateRow: {},
-                    onIndent: {},
-                    onOutdent: {},
-                    onToggleComplete: onToggleComplete,
-                    onDeleteIfEmpty: onDeleteIfEmpty,
-                    onCommandFocus: {},
-                    onBeginEditing: {},
-                    wrapsText: true,
-                    isComplete: isComplete
-                )
-                .frame(minHeight: 34)
-                .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
+                Text(styledInlineTagText(title, isComplete: isComplete))
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
             }
 
             if let projectTitle = item.projectTitle {
                 Text(projectTitle)
                     .fontWeight(.semibold)
                     .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.gray.opacity(0.7))
                     .lineLimit(2)
                     .padding(.leading, 34)
-                    .padding(.top, -6)
+                    .padding(.top, 1)
             }
 
         }
-        .padding(.vertical, 1)
+        .padding(.vertical, 4)
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
+        .onTapGesture(perform: onOpen)
+        .onHover { isHovering in
+            if isHovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 }
 
