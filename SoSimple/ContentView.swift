@@ -221,6 +221,11 @@ final class OutlineStore: ObservableObject {
         return bucketItems + taggedItems
     }
 
+    func taskBucketID(filteredBy selectedTag: String?) -> UUID? {
+        let tag = selectedTag == "l" ? "l" : "i"
+        return taskBucket(for: tag)?.id
+    }
+
     func setTitle(_ title: String, for id: UUID) {
         update(id) { item in
             item.title = title
@@ -1148,6 +1153,11 @@ struct TagSidebar: View {
                     ForEach(filterOptions, id: \.tag) { option in
                         FilterChip(title: option.title, isSelected: selectedTag == option.tag) {
                             selectedTag = option.tag
+                            if NSEvent.modifierFlags.contains(.command),
+                               let bucketID = store.taskBucketID(filteredBy: option.tag) {
+                                editingItemID = nil
+                                onOpenItem(bucketID)
+                            }
                         }
                     }
                 }
