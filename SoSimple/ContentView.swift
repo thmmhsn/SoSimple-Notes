@@ -20,13 +20,28 @@ struct VisibleOutlineItem: Identifiable {
     let depth: Int
 }
 
+private struct TemporaryTabbedDocument: Decodable {
+    var selectedTabID: UUID?
+    var tabs: [TemporaryTab]
+
+    var selectedItems: [OutlineItem]? {
+        if let selectedTabID, let tab = tabs.first(where: { $0.id == selectedTabID }) {
+            return tab.items
+        }
+        return tabs.first?.items
+    }
+}
+
+private struct TemporaryTab: Decodable {
+    var id: UUID
+    var items: [OutlineItem]
+}
+
 @MainActor
 final class OutlineStore: ObservableObject {
     @Published private(set) var items: [OutlineItem] = [] {
         didSet { save() }
     }
-
-    @Published var focusedItemID: UUID?
 
     private let fileManager = FileManager.default
     private let storageURL: URL
@@ -36,19 +51,19 @@ final class OutlineStore: ObservableObject {
         load()
     }
 
-    var visibleItems: [VisibleOutlineItem] {
+    func visibleItems(focusedItemID: UUID?) -> [VisibleOutlineItem] {
         if let focusedItemID, let item = item(with: focusedItemID) {
             return flatten(item.children, depth: 0)
         }
         return flatten(items, depth: 0)
     }
 
-    var breadcrumbs: [OutlineItem] {
+    func breadcrumbs(focusedItemID: UUID?) -> [OutlineItem] {
         guard let focusedItemID else { return [] }
         return path(to: focusedItemID, in: items) ?? []
     }
 
-    var focusedItem: OutlineItem? {
+    func focusedItem(focusedItemID: UUID?) -> OutlineItem? {
         guard let focusedItemID else { return nil }
         return item(with: focusedItemID)
     }
@@ -95,8 +110,8 @@ final class OutlineStore: ObservableObject {
         return child.id
     }
 
-    func indent(_ id: UUID) {
-        guard let parentID = previousVisibleItem(before: id), let item = remove(id, from: &items) else {
+    func indent(_ id: UUID, focusedItemID: UUID?) {
+        guard let parentID = previousVisibleItem(before: id, focusedItemID: focusedItemID), let item = remove(id, from: &items) else {
             return
         }
 
@@ -115,10 +130,6 @@ final class OutlineStore: ObservableObject {
             return false
         }
 
-        if focusedItemID == id {
-            focusedItemID = nil
-        }
-
         return remove(id, from: &items) != nil
     }
 
@@ -128,20 +139,16 @@ final class OutlineStore: ObservableObject {
         }
     }
 
-    func focus(_ id: UUID?) {
-        focusedItemID = id
-    }
-
-    func nextVisibleItem(after id: UUID) -> UUID? {
-        let ids = visibleItems.map(\.id)
+    func nextVisibleItem(after id: UUID, focusedItemID: UUID?) -> UUID? {
+        let ids = visibleItems(focusedItemID: focusedItemID).map(\.id)
         guard let index = ids.firstIndex(of: id), index < ids.index(before: ids.endIndex) else {
             return nil
         }
         return ids[ids.index(after: index)]
     }
 
-    func previousVisibleItem(before id: UUID) -> UUID? {
-        let ids = visibleItems.map(\.id)
+    func previousVisibleItem(before id: UUID, focusedItemID: UUID?) -> UUID? {
+        let ids = visibleItems(focusedItemID: focusedItemID).map(\.id)
         guard let index = ids.firstIndex(of: id), index > ids.startIndex else {
             return nil
         }
@@ -163,23 +170,26 @@ final class OutlineStore: ObservableObject {
 
     private func load() {
         guard
-            let data = try? Data(contentsOf: storageURL),
-            let decoded = try? JSONDecoder().decode([OutlineItem].self, from: data),
-            !decoded.isEmpty
+            let data = try? Data(contentsOf: storageURL)
         else {
-            items = [
-                OutlineItem(
-                    title: "Home",
-                    children: [
-                        OutlineItem(title: "Work"),
-                        OutlineItem(title: "Personal")
-                    ]
-                )
-            ]
+            loadDefaultItems()
             return
         }
 
-        items = decoded
+        if
+            let legacyItems = try? JSONDecoder().decode([OutlineItem].self, from: data),
+            !legacyItems.isEmpty {
+            items = legacyItems
+            return
+        }
+
+        if let temporaryDocument = try? JSONDecoder().decode(TemporaryTabbedDocument.self, from: data),
+            let selectedItems = temporaryDocument.selectedItems {
+            items = selectedItems
+            return
+        }
+
+        loadDefaultItems()
     }
 
     private func save() {
@@ -192,6 +202,18 @@ final class OutlineStore: ObservableObject {
         } catch {
             assertionFailure("Unable to save outline: \(error.localizedDescription)")
         }
+    }
+
+    private func loadDefaultItems() {
+        items = [
+            OutlineItem(
+                title: "Home",
+                children: [
+                    OutlineItem(title: "Work"),
+                    OutlineItem(title: "Personal")
+                ]
+            )
+        ]
     }
 
     private func item(with id: UUID) -> OutlineItem? {
@@ -288,85 +310,25 @@ final class OutlineStore: ObservableObject {
 }
 
 struct ContentView: View {
-    @StateObject private var store = OutlineStore()
+    @ObservedObject var store: OutlineStore
     @State private var editingItemID: UUID?
+    @State private var focusedItemID: UUID?
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if let focusedItem = store.focusedItem {
-                        Text(focusedItem.title.isEmpty ? "Untitled" : focusedItem.title)
-                            .font(.system(size: 18, weight: .semibold))
-                            .padding(.horizontal, 8)
-                            .padding(.bottom, 12)
-                    }
-
-                    ForEach(store.visibleItems) { item in
-                        OutlineRow(
-                            item: item,
-                            title: Binding(
-                                get: { store.title(for: item.id) },
-                                set: { store.setTitle($0, for: item.id) }
-                            ),
-                            isExpanded: store.isExpanded(item.id),
-                            childCount: store.childCount(for: item.id),
-                            editingItemID: $editingItemID,
-                            onToggleExpanded: {
-                                store.toggleExpanded(item.id)
-                            },
-                            onFocus: {
-                                focusAndEditFirstVisible(item.id)
-                            },
-                            onAddChild: {
-                                let childID = store.addChild(to: item.id)
-                                editingItemID = childID
-                            },
-                            onMoveUp: {
-                                if let previousID = store.previousVisibleItem(before: item.id) {
-                                    editingItemID = previousID
-                                }
-                            },
-                            onMoveDown: {
-                                if let nextID = store.nextVisibleItem(after: item.id) {
-                                    editingItemID = nextID
-                                }
-                            },
-                            onCreateRow: {
-                                let newID = store.addSibling(after: item.id)
-                                editingItemID = newID
-                            },
-                            onIndent: {
-                                store.indent(item.id)
-                                editingItemID = item.id
-                            },
-                            onOutdent: {
-                                store.outdent(item.id)
-                                editingItemID = item.id
-                            },
-                            onDeleteIfEmpty: {
-                                deleteIfEmpty(item.id)
-                            }
-                        )
-                    }
-                }
-                .padding(24)
-            }
-        }
+        outlineContent
+        .background(WindowTabConfigurator())
         .background(colorScheme == .dark ? Color(red: 0.08, green: 0.08, blue: 0.09) : Color(nsColor: .textBackgroundColor))
         .overlay {
             RowKeyboardMonitor(
                 editingItemID: $editingItemID,
                 onMoveUp: { id in
-                    if let previousID = store.previousVisibleItem(before: id) {
+                    if let previousID = store.previousVisibleItem(before: id, focusedItemID: focusedItemID) {
                         editingItemID = previousID
                     }
                 },
                 onMoveDown: { id in
-                    if let nextID = store.nextVisibleItem(after: id) {
+                    if let nextID = store.nextVisibleItem(after: id, focusedItemID: focusedItemID) {
                         editingItemID = nextID
                     }
                 },
@@ -387,10 +349,76 @@ struct ContentView: View {
         }
     }
 
+    private var outlineContent: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if let focusedItem {
+                        Text(focusedItem.title.isEmpty ? "Untitled" : focusedItem.title)
+                            .font(.system(size: 18, weight: .semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 12)
+                    }
+
+                    ForEach(visibleItems) { item in
+                        OutlineRow(
+                            item: item,
+                            title: Binding(
+                                get: { store.title(for: item.id) },
+                                set: { store.setTitle($0, for: item.id) }
+                            ),
+                            isExpanded: store.isExpanded(item.id),
+                            childCount: store.childCount(for: item.id),
+                            editingItemID: $editingItemID,
+                            onToggleExpanded: {
+                                store.toggleExpanded(item.id)
+                            },
+                            onFocus: {
+                                focusAndEditFirstVisible(item.id)
+                            },
+                            onAddChild: {
+                                let childID = store.addChild(to: item.id)
+                                editingItemID = childID
+                            },
+                            onMoveUp: {
+                                if let previousID = store.previousVisibleItem(before: item.id, focusedItemID: focusedItemID) {
+                                    editingItemID = previousID
+                                }
+                            },
+                            onMoveDown: {
+                                if let nextID = store.nextVisibleItem(after: item.id, focusedItemID: focusedItemID) {
+                                    editingItemID = nextID
+                                }
+                            },
+                            onCreateRow: {
+                                let newID = store.addSibling(after: item.id)
+                                editingItemID = newID
+                            },
+                            onIndent: {
+                                store.indent(item.id, focusedItemID: focusedItemID)
+                                editingItemID = item.id
+                            },
+                            onOutdent: {
+                                store.outdent(item.id)
+                                editingItemID = item.id
+                            },
+                            onDeleteIfEmpty: {
+                                deleteIfEmpty(item.id)
+                            }
+                        )
+                    }
+                }
+                .padding(24)
+            }
+        }
+    }
+
     private var header: some View {
         HStack(spacing: 8) {
             Button {
-                store.focus(nil)
+                focusedItemID = nil
                 editingItemID = nil
             } label: {
                 Image(systemName: "house")
@@ -398,7 +426,7 @@ struct ContentView: View {
             .buttonStyle(.borderless)
             .help("Show full outline")
 
-            ForEach(store.breadcrumbs) { item in
+            ForEach(breadcrumbs) { item in
                 Image(systemName: "chevron.right")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -420,10 +448,14 @@ struct ContentView: View {
             return false
         }
 
-        let previousID = store.previousVisibleItem(before: id)
-        let nextID = store.nextVisibleItem(after: id)
+        let previousID = store.previousVisibleItem(before: id, focusedItemID: focusedItemID)
+        let nextID = store.nextVisibleItem(after: id, focusedItemID: focusedItemID)
         guard store.removeIfEmpty(id) else {
             return false
+        }
+
+        if focusedItemID == id {
+            focusedItemID = nil
         }
 
         editingItemID = previousID ?? nextID
@@ -431,8 +463,20 @@ struct ContentView: View {
     }
 
     private func focusAndEditFirstVisible(_ id: UUID) {
-        store.focus(id)
-        editingItemID = store.visibleItems.first?.id
+        focusedItemID = id
+        editingItemID = visibleItems.first?.id
+    }
+
+    private var visibleItems: [VisibleOutlineItem] {
+        store.visibleItems(focusedItemID: focusedItemID)
+    }
+
+    private var breadcrumbs: [OutlineItem] {
+        store.breadcrumbs(focusedItemID: focusedItemID)
+    }
+
+    private var focusedItem: OutlineItem? {
+        store.focusedItem(focusedItemID: focusedItemID)
     }
 }
 
@@ -789,6 +833,29 @@ struct RowKeyboardMonitor: NSViewRepresentable {
     }
 }
 
+struct WindowTabConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> ConfiguringView {
+        ConfiguringView()
+    }
+
+    func updateNSView(_ view: ConfiguringView, context: Context) {
+        view.configureWindow()
+    }
+
+    final class ConfiguringView: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            configureWindow()
+        }
+
+        func configureWindow() {
+            guard let window else { return }
+            window.tabbingMode = .preferred
+            window.tabbingIdentifier = "SoSimpleOutlineWindow"
+        }
+    }
+}
+
 #Preview {
-    ContentView()
+    ContentView(store: OutlineStore())
 }
