@@ -92,10 +92,14 @@ final class OutlineStore: ObservableObject {
     }
 
     func visibleItems(focusedItemID: UUID?) -> [VisibleOutlineItem] {
+        visibleItems(focusedItemID: focusedItemID, collapsedItemIDs: [])
+    }
+
+    func visibleItems(focusedItemID: UUID?, collapsedItemIDs: Set<UUID>) -> [VisibleOutlineItem] {
         if let focusedItemID, let item = item(with: focusedItemID) {
-            return flatten(item.children, depth: 0)
+            return flatten(item.children, depth: 0, collapsedItemIDs: collapsedItemIDs)
         }
-        return flatten(items, depth: 0)
+        return flatten(items, depth: 0, collapsedItemIDs: collapsedItemIDs)
     }
 
     func breadcrumbs(focusedItemID: UUID?) -> [OutlineItem] {
@@ -161,6 +165,16 @@ final class OutlineStore: ObservableObject {
 
         update(parentID) { parent in
             parent.isExpanded = true
+            parent.children.append(item)
+        }
+    }
+
+    func indent(_ id: UUID, under parentID: UUID) {
+        guard let item = remove(id, from: &items) else {
+            return
+        }
+
+        update(parentID) { parent in
             parent.children.append(item)
         }
     }
@@ -348,11 +362,11 @@ final class OutlineStore: ObservableObject {
         return false
     }
 
-    private func flatten(_ source: [OutlineItem], depth: Int) -> [VisibleOutlineItem] {
+    private func flatten(_ source: [OutlineItem], depth: Int, collapsedItemIDs: Set<UUID>) -> [VisibleOutlineItem] {
         source.flatMap { item -> [VisibleOutlineItem] in
             var rows = [VisibleOutlineItem(id: item.id, depth: depth)]
-            if item.isExpanded {
-                rows.append(contentsOf: flatten(item.children, depth: depth + 1))
+            if !collapsedItemIDs.contains(item.id) {
+                rows.append(contentsOf: flatten(item.children, depth: depth + 1, collapsedItemIDs: collapsedItemIDs))
             }
             return rows
         }
@@ -375,8 +389,10 @@ struct ContentView: View {
     @ObservedObject var store: OutlineStore
     let minimumWidth: CGFloat
     let updatesWindowTitle: Bool
+    @State private var paneID = UUID()
     @State private var editingItemID: UUID?
     @State private var focusedItemID: UUID?
+    @State private var collapsedItemIDs = Set<UUID>()
     @State private var selectedItemIDs = Set<UUID>()
     @State private var rowFrames: [UUID: CGRect] = [:]
     @State private var selectionDragStart: CGPoint?
@@ -412,15 +428,16 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 RowKeyboardMonitor(
+                    paneID: paneID,
                     editingItemID: $editingItemID,
                     selectedItemIDs: $selectedItemIDs,
                     onMoveUp: { id in
-                        if let previousID = store.previousVisibleItem(before: id, focusedItemID: focusedItemID) {
+                        if let previousID = previousVisibleItem(before: id) {
                             editingItemID = previousID
                         }
                     },
                     onMoveDown: { id in
-                        if let nextID = store.nextVisibleItem(after: id, focusedItemID: focusedItemID) {
+                        if let nextID = nextVisibleItem(after: id) {
                             editingItemID = nextID
                         }
                     },
@@ -456,6 +473,7 @@ struct ContentView: View {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         if let focusedItem {
                             FocusedTitleTextField(
+                                paneID: paneID,
                                 text: Binding(
                                     get: { store.title(for: focusedItem.id) },
                                     set: { store.setTitle($0, for: focusedItem.id) }
@@ -480,18 +498,19 @@ struct ContentView: View {
 
                         ForEach(visibleItems) { item in
                             OutlineRow(
+                                paneID: paneID,
                                 item: item,
                                 title: Binding(
                                     get: { store.title(for: item.id) },
                                     set: { store.setTitle($0, for: item.id) }
                                 ),
-                                isExpanded: store.isExpanded(item.id),
+                                isExpanded: !collapsedItemIDs.contains(item.id),
                                 childCount: store.childCount(for: item.id),
                                 isComplete: store.isComplete(item.id),
                                 isSelected: selectedItemIDs.contains(item.id),
                                 editingItemID: $editingItemID,
                                 onToggleExpanded: {
-                                    store.toggleExpanded(item.id)
+                                    toggleExpanded(item.id)
                                 },
                                 onFocus: {
                                     focusAndEditFirstVisible(item.id)
@@ -501,15 +520,16 @@ struct ContentView: View {
                                 },
                                 onAddChild: {
                                     let childID = store.addChild(to: item.id)
+                                    collapsedItemIDs.remove(item.id)
                                     editingItemID = childID
                                 },
                                 onMoveUp: {
-                                    if let previousID = store.previousVisibleItem(before: item.id, focusedItemID: focusedItemID) {
+                                    if let previousID = previousVisibleItem(before: item.id) {
                                         editingItemID = previousID
                                     }
                                 },
                                 onMoveDown: {
-                                    if let nextID = store.nextVisibleItem(after: item.id, focusedItemID: focusedItemID) {
+                                    if let nextID = nextVisibleItem(after: item.id) {
                                         editingItemID = nextID
                                     }
                                 },
@@ -518,8 +538,11 @@ struct ContentView: View {
                                     editingItemID = newID
                                 },
                                 onIndent: {
-                                    store.indent(item.id, focusedItemID: focusedItemID)
-                                    editingItemID = item.id
+                                    if let parentID = previousVisibleItem(before: item.id) {
+                                        store.indent(item.id, under: parentID)
+                                        collapsedItemIDs.remove(parentID)
+                                        editingItemID = item.id
+                                    }
                                 },
                                 onOutdent: {
                                     store.outdent(item.id)
@@ -610,8 +633,8 @@ struct ContentView: View {
             return false
         }
 
-        let previousID = store.previousVisibleItem(before: id, focusedItemID: focusedItemID)
-        let nextID = store.nextVisibleItem(after: id, focusedItemID: focusedItemID)
+        let previousID = previousVisibleItem(before: id)
+        let nextID = nextVisibleItem(after: id)
         guard store.removeIfEmpty(id) else {
             return false
         }
@@ -634,6 +657,7 @@ struct ContentView: View {
     private func addItemForCurrentView() {
         isFocusedTitleEditing = false
         if let focusedItemID {
+            collapsedItemIDs.remove(focusedItemID)
             editingItemID = store.addChild(to: focusedItemID)
         } else {
             editingItemID = store.addRoot()
@@ -684,8 +708,32 @@ struct ContentView: View {
         )
     }
 
+    private func toggleExpanded(_ id: UUID) {
+        if collapsedItemIDs.contains(id) {
+            collapsedItemIDs.remove(id)
+        } else {
+            collapsedItemIDs.insert(id)
+        }
+    }
+
+    private func nextVisibleItem(after id: UUID) -> UUID? {
+        let ids = visibleItems.map(\.id)
+        guard let index = ids.firstIndex(of: id), index < ids.index(before: ids.endIndex) else {
+            return nil
+        }
+        return ids[ids.index(after: index)]
+    }
+
+    private func previousVisibleItem(before id: UUID) -> UUID? {
+        let ids = visibleItems.map(\.id)
+        guard let index = ids.firstIndex(of: id), index > ids.startIndex else {
+            return nil
+        }
+        return ids[ids.index(before: index)]
+    }
+
     private var visibleItems: [VisibleOutlineItem] {
-        store.visibleItems(focusedItemID: focusedItemID)
+        store.visibleItems(focusedItemID: focusedItemID, collapsedItemIDs: collapsedItemIDs)
     }
 
     private var breadcrumbs: [OutlineItem] {
@@ -749,10 +797,22 @@ struct WorkspaceView: View {
             }
         )
         .frame(minWidth: 720, minHeight: 520)
+        .toolbar {
+            Button {
+                isSplitViewEnabled.toggle()
+            } label: {
+                Label(
+                    isSplitViewEnabled ? "Close Split View" : "Open Split View",
+                    systemImage: isSplitViewEnabled ? "rectangle" : "rectangle.split.2x1"
+                )
+            }
+            .help(isSplitViewEnabled ? "Close Split View" : "Open Split View")
+        }
     }
 }
 
 struct OutlineRow: View {
+    let paneID: UUID
     let item: VisibleOutlineItem
     @Binding var title: String
     let isExpanded: Bool
@@ -797,6 +857,7 @@ struct OutlineRow: View {
             .disabled(childCount == 0)
             
             OutlineTextField(
+                paneID: paneID,
                 id: item.id,
                 text: $title,
                 editingItemID: $editingItemID,
@@ -853,6 +914,7 @@ struct OutlineRow: View {
 }
 
 struct OutlineTextField: NSViewRepresentable {
+    let paneID: UUID
     let id: UUID
     @Binding var text: String
     @Binding var editingItemID: UUID?
@@ -869,6 +931,7 @@ struct OutlineTextField: NSViewRepresentable {
 
     func makeNSView(context: Context) -> KeyHandlingTextView {
         let textView = KeyHandlingTextView()
+        textView.paneID = paneID
         textView.representedItemID = id
         textView.drawsBackground = false
         textView.isEditable = true
@@ -897,6 +960,7 @@ struct OutlineTextField: NSViewRepresentable {
 
     func updateNSView(_ textView: KeyHandlingTextView, context: Context) {
         context.coordinator.parent = self
+        textView.paneID = paneID
         textView.representedItemID = id
 
         if textView.string != text {
@@ -917,8 +981,9 @@ struct OutlineTextField: NSViewRepresentable {
 
         let shouldEdit = editingItemID == id
         let isFirstResponder = textView.window?.firstResponder === textView
-        if shouldEdit, !isFirstResponder {
+        if shouldEdit, !isFirstResponder, canClaimFirstResponder(textView) {
             DispatchQueue.main.async {
+                guard canClaimFirstResponder(textView) else { return }
                 textView.window?.makeFirstResponder(textView)
                 textView.selectedRange = NSRange(location: textView.string.count, length: 0)
             }
@@ -944,6 +1009,14 @@ struct OutlineTextField: NSViewRepresentable {
         if range.length > 0 {
             textView.textStorage?.setAttributes(attributes, range: range)
         }
+    }
+
+    private func canClaimFirstResponder(_ textView: KeyHandlingTextView) -> Bool {
+        guard let firstResponder = textView.window?.firstResponder as? KeyHandlingTextView else {
+            return true
+        }
+
+        return firstResponder.paneID == paneID
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -1010,12 +1083,14 @@ struct OutlineTextField: NSViewRepresentable {
 }
 
 struct FocusedTitleTextField: NSViewRepresentable {
+    let paneID: UUID
     @Binding var text: String
     let onBeginEditing: () -> Void
     let onCreateRow: () -> Void
 
     func makeNSView(context: Context) -> KeyHandlingTextView {
         let textView = KeyHandlingTextView()
+        textView.paneID = paneID
         textView.drawsBackground = false
         textView.isEditable = true
         textView.isSelectable = true
@@ -1034,6 +1109,7 @@ struct FocusedTitleTextField: NSViewRepresentable {
 
     func updateNSView(_ textView: KeyHandlingTextView, context: Context) {
         context.coordinator.parent = self
+        textView.paneID = paneID
 
         if textView.string != text {
             textView.string = text
@@ -1132,6 +1208,7 @@ struct SelectionClearMouseMonitor: NSViewRepresentable {
 }
 
 final class KeyHandlingTextView: NSTextView {
+    var paneID: UUID?
     var representedItemID: UUID?
     var onMoveUp: (() -> Void)?
     var onMoveDown: (() -> Void)?
@@ -1220,6 +1297,7 @@ final class KeyHandlingTextView: NSTextView {
 }
 
 struct RowKeyboardMonitor: NSViewRepresentable {
+    let paneID: UUID
     @Binding var editingItemID: UUID?
     @Binding var selectedItemIDs: Set<UUID>
     let onMoveUp: (UUID) -> Void
@@ -1234,6 +1312,7 @@ struct RowKeyboardMonitor: NSViewRepresentable {
     }
 
     func updateNSView(_ view: MonitorView, context: Context) {
+        view.paneID = paneID
         view.editingItemID = editingItemID
         view.selectedItemIDs = selectedItemIDs
         view.onMoveUp = onMoveUp
@@ -1243,6 +1322,7 @@ struct RowKeyboardMonitor: NSViewRepresentable {
     }
 
     final class MonitorView: NSView {
+        var paneID: UUID?
         var editingItemID: UUID?
         var selectedItemIDs = Set<UUID>()
         var onMoveUp: ((UUID) -> Void)?
@@ -1267,6 +1347,13 @@ struct RowKeyboardMonitor: NSViewRepresentable {
                     return event
                 }
 
+                guard
+                    let firstResponder = self.window?.firstResponder as? KeyHandlingTextView,
+                    firstResponder.paneID == self.paneID
+                else {
+                    return event
+                }
+
                 if event.keyCode == 51 || event.keyCode == 117 {
                     if self.selectedItemIDs.count > 1 {
                         self.onDeleteSelection?()
@@ -1279,7 +1366,6 @@ struct RowKeyboardMonitor: NSViewRepresentable {
                 }
 
                 guard
-                    let firstResponder = self.window?.firstResponder as? KeyHandlingTextView,
                     firstResponder.representedItemID == editingItemID
                 else {
                     return event
