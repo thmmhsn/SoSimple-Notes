@@ -31,17 +31,17 @@ struct SoSimpleApp: App {
                 Button("Toggle Split View") {
                     NotificationCenter.default.post(name: .toggleWorkspaceSplitView, object: nil)
                 }
-                .keyboardShortcut("\\", modifiers: [.command, .shift])
+                .keyboardShortcut(.downArrow, modifiers: [.command, .shift])
 
                 Button("Toggle Pins Sidebar") {
                     NotificationCenter.default.post(name: .toggleWorkspacePinnedSidebar, object: nil)
                 }
-                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
 
                 Button("Toggle Tasks Sidebar") {
                     NotificationCenter.default.post(name: .toggleWorkspaceTaskSidebar, object: nil)
                 }
-                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .keyboardShortcut(.rightArrow, modifiers: [.command, .shift])
             }
         }
     }

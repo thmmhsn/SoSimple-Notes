@@ -42,7 +42,6 @@ struct OutlineItem: Identifiable, Codable, Equatable {
     var title: String
     var isExpanded = true
     var isComplete = false
-    var isPinned = false
     var tags: [String] = []
     var children: [OutlineItem] = []
 
@@ -51,7 +50,6 @@ struct OutlineItem: Identifiable, Codable, Equatable {
         title: String,
         isExpanded: Bool = true,
         isComplete: Bool = false,
-        isPinned: Bool = false,
         tags: [String] = [],
         children: [OutlineItem] = []
     ) {
@@ -59,7 +57,6 @@ struct OutlineItem: Identifiable, Codable, Equatable {
         self.title = title
         self.isExpanded = isExpanded
         self.isComplete = isComplete
-        self.isPinned = isPinned
         self.tags = tags
         self.children = children
     }
@@ -69,7 +66,6 @@ struct OutlineItem: Identifiable, Codable, Equatable {
         case title
         case isExpanded
         case isComplete
-        case isPinned
         case tags
         case children
     }
@@ -80,7 +76,6 @@ struct OutlineItem: Identifiable, Codable, Equatable {
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
         isExpanded = try container.decodeIfPresent(Bool.self, forKey: .isExpanded) ?? true
         isComplete = try container.decodeIfPresent(Bool.self, forKey: .isComplete) ?? false
-        isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
         children = try container.decodeIfPresent([OutlineItem].self, forKey: .children) ?? []
     }
@@ -269,10 +264,6 @@ final class OutlineStore: ObservableObject {
         item(with: id)?.isComplete ?? false
     }
 
-    func isPinned(_ id: UUID) -> Bool {
-        item(with: id)?.isPinned ?? false
-    }
-
     func childCount(for id: UUID) -> Int {
         item(with: id)?.children.count ?? 0
     }
@@ -348,12 +339,6 @@ final class OutlineStore: ObservableObject {
     func toggleComplete(_ id: UUID) {
         update(id) { item in
             item.isComplete.toggle()
-        }
-    }
-
-    func togglePinned(_ id: UUID) {
-        update(id) { item in
-            item.isPinned.toggle()
         }
     }
 
@@ -585,7 +570,7 @@ final class OutlineStore: ObservableObject {
             let displayTitle = title.isEmpty ? "Untitled" : title
             let currentPath = path + [displayTitle]
             let currentProjectTitle = projectTitle(in: title) ?? inheritedProjectTitle
-            var rows: [TaggedOutlineItem] = item.isPinned
+            var rows: [TaggedOutlineItem] = title.contains("*")
                 ? [
                     TaggedOutlineItem(
                         id: item.id,
@@ -837,7 +822,6 @@ struct ContentView: View {
                                 isExpanded: !collapsedItemIDs.contains(item.id),
                                 childCount: store.childCount(for: item.id),
                                 isComplete: store.isComplete(item.id),
-                                isPinned: store.isPinned(item.id),
                                 isSelected: selectedItemIDs.contains(item.id),
                                 editingItemID: $editingItemID,
                                 onToggleExpanded: {
@@ -881,9 +865,6 @@ struct ContentView: View {
                                 },
                                 onToggleComplete: {
                                     store.toggleComplete(item.id)
-                                },
-                                onTogglePinned: {
-                                    store.togglePinned(item.id)
                                 },
                                 onDeleteIfEmpty: {
                                     deleteIfEmpty(item.id)
@@ -1220,9 +1201,6 @@ struct PinnedSidebar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: "pin.fill")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
                 Text("Pinned")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
@@ -1264,11 +1242,6 @@ struct PinnedNoteRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
-                Image(systemName: "pin.fill")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 26, height: 20)
-
                 Text(styledInlineTagText(title, isComplete: isComplete))
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1496,7 +1469,6 @@ struct OutlineRow: View {
     let isExpanded: Bool
     let childCount: Int
     let isComplete: Bool
-    let isPinned: Bool
     let isSelected: Bool
     @Binding var editingItemID: UUID?
 
@@ -1510,7 +1482,6 @@ struct OutlineRow: View {
     let onIndent: () -> Void
     let onOutdent: () -> Void
     let onToggleComplete: () -> Void
-    let onTogglePinned: () -> Void
     let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
@@ -1555,19 +1526,6 @@ struct OutlineRow: View {
                 )
                 .frame(height: 34)
                 .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
-
-                Button {
-                    onRowInteraction()
-                    onTogglePinned()
-                } label: {
-                    Image(systemName: isPinned ? "pin.fill" : "pin")
-                        .font(.system(size: 13))
-                        .foregroundStyle(isPinned ? Color.accentColor : Color.secondary.opacity(0.45))
-                        .frame(width: 28, height: 34)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(isPinned ? "Unpin note" : "Pin note")
             }
 
 //            Button(action: onFocus) {
@@ -2114,6 +2072,11 @@ struct RowKeyboardMonitor: NSViewRepresentable {
                     return event
                 }
 
+                let shortcutFlags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+                if shortcutFlags == [.command, .shift] {
+                    return event
+                }
+
                 if event.specialKey == .upArrow || event.keyCode == 126 {
                     self.onMoveUp?(editingItemID)
                     return nil
@@ -2203,15 +2166,40 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
         var onTogglePinnedSidebar: (() -> Void)?
         var onToggleTaskSidebar: (() -> Void)?
         private var observers: [NSObjectProtocol] = []
+        private var keyMonitor: Any?
 
         deinit {
             for observer in observers {
                 NotificationCenter.default.removeObserver(observer)
             }
+            if let keyMonitor {
+                NSEvent.removeMonitor(keyMonitor)
+            }
         }
 
         func install() {
             guard observers.isEmpty else { return }
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, self.isActiveWindow else { return event }
+
+                let shortcutFlags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+                guard shortcutFlags == [.command, .shift] else { return event }
+
+                switch event.keyCode {
+                case 125:
+                    self.onToggleSplitView?()
+                    return nil
+                case 123:
+                    self.onTogglePinnedSidebar?()
+                    return nil
+                case 124:
+                    self.onToggleTaskSidebar?()
+                    return nil
+                default:
+                    return event
+                }
+            }
+
             observers.append(NotificationCenter.default.addObserver(
                 forName: .toggleWorkspaceSplitView,
                 object: nil,
