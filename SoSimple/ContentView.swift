@@ -12,7 +12,39 @@ struct OutlineItem: Identifiable, Codable, Equatable {
     var id = UUID()
     var title: String
     var isExpanded = true
+    var isComplete = false
     var children: [OutlineItem] = []
+
+    init(
+        id: UUID = UUID(),
+        title: String,
+        isExpanded: Bool = true,
+        isComplete: Bool = false,
+        children: [OutlineItem] = []
+    ) {
+        self.id = id
+        self.title = title
+        self.isExpanded = isExpanded
+        self.isComplete = isComplete
+        self.children = children
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case isExpanded
+        case isComplete
+        case children
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        isExpanded = try container.decodeIfPresent(Bool.self, forKey: .isExpanded) ?? true
+        isComplete = try container.decodeIfPresent(Bool.self, forKey: .isComplete) ?? false
+        children = try container.decodeIfPresent([OutlineItem].self, forKey: .children) ?? []
+    }
 }
 
 struct VisibleOutlineItem: Identifiable {
@@ -90,6 +122,10 @@ final class OutlineStore: ObservableObject {
         item(with: id)?.isExpanded ?? false
     }
 
+    func isComplete(_ id: UUID) -> Bool {
+        item(with: id)?.isComplete ?? false
+    }
+
     func childCount(for id: UUID) -> Int {
         item(with: id)?.children.count ?? 0
     }
@@ -149,6 +185,12 @@ final class OutlineStore: ObservableObject {
     func toggleExpanded(_ id: UUID) {
         update(id) { item in
             item.isExpanded.toggle()
+        }
+    }
+
+    func toggleComplete(_ id: UUID) {
+        update(id) { item in
+            item.isComplete.toggle()
         }
     }
 
@@ -391,13 +433,6 @@ struct ContentView: View {
             Text("This will delete \(pendingDeleteItemIDs.count) selected notes and their sub-notes.")
         }
         .frame(minWidth: 720, minHeight: 520)
-        .toolbar {
-            Button {
-                addItemForCurrentView()
-            } label: {
-                Label("Add Item", systemImage: "plus")
-            }
-        }
     }
 
     private var outlineContent: some View {
@@ -440,6 +475,7 @@ struct ContentView: View {
                                 ),
                                 isExpanded: store.isExpanded(item.id),
                                 childCount: store.childCount(for: item.id),
+                                isComplete: store.isComplete(item.id),
                                 isSelected: selectedItemIDs.contains(item.id),
                                 editingItemID: $editingItemID,
                                 onToggleExpanded: {
@@ -476,6 +512,9 @@ struct ContentView: View {
                                 onOutdent: {
                                     store.outdent(item.id)
                                     editingItemID = item.id
+                                },
+                                onToggleComplete: {
+                                    store.toggleComplete(item.id)
                                 },
                                 onDeleteIfEmpty: {
                                     deleteIfEmpty(item.id)
@@ -681,6 +720,7 @@ struct OutlineRow: View {
     @Binding var title: String
     let isExpanded: Bool
     let childCount: Int
+    let isComplete: Bool
     let isSelected: Bool
     @Binding var editingItemID: UUID?
 
@@ -693,6 +733,7 @@ struct OutlineRow: View {
     let onCreateRow: () -> Void
     let onIndent: () -> Void
     let onOutdent: () -> Void
+    let onToggleComplete: () -> Void
     let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
@@ -727,9 +768,11 @@ struct OutlineRow: View {
                 onCreateRow: onCreateRow,
                 onIndent: onIndent,
                 onOutdent: onOutdent,
+                onToggleComplete: onToggleComplete,
                 onDeleteIfEmpty: onDeleteIfEmpty,
                 onCommandFocus: onFocus,
-                onBeginEditing: onRowInteraction
+                onBeginEditing: onRowInteraction,
+                isComplete: isComplete
             )
             .frame(height: 34)
 
@@ -781,9 +824,11 @@ struct OutlineTextField: NSViewRepresentable {
     let onCreateRow: () -> Void
     let onIndent: () -> Void
     let onOutdent: () -> Void
+    let onToggleComplete: () -> Void
     let onDeleteIfEmpty: () -> Bool
     let onCommandFocus: () -> Void
     let onBeginEditing: () -> Void
+    let isComplete: Bool
 
     func makeNSView(context: Context) -> KeyHandlingTextView {
         let textView = KeyHandlingTextView()
@@ -804,9 +849,11 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onCreateRow = onCreateRow
         textView.onIndent = onIndent
         textView.onOutdent = onOutdent
+        textView.onToggleComplete = onToggleComplete
         textView.onDeleteIfEmpty = onDeleteIfEmpty
         textView.onCommandFocus = onCommandFocus
         textView.onBeginEditing = onBeginEditing
+        applyCompletionStyle(to: textView)
         return textView
     }
 
@@ -822,10 +869,12 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onCreateRow = onCreateRow
         textView.onIndent = onIndent
         textView.onOutdent = onOutdent
+        textView.onToggleComplete = onToggleComplete
         textView.onDeleteIfEmpty = onDeleteIfEmpty
         textView.onCommandFocus = onCommandFocus
         textView.onBeginEditing = onBeginEditing
         textView.delegate = context.coordinator
+        applyCompletionStyle(to: textView)
 
         let shouldEdit = editingItemID == id
         let isFirstResponder = textView.window?.firstResponder === textView
@@ -839,6 +888,23 @@ struct OutlineTextField: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
+    }
+
+    private func applyCompletionStyle(to textView: NSTextView) {
+        let textColor = isComplete ? NSColor.secondaryLabelColor : NSColor.labelColor
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 16),
+            .foregroundColor: textColor,
+            .strikethroughStyle: isComplete ? NSUnderlineStyle.single.rawValue : 0,
+            .strikethroughColor: textColor
+        ]
+        textView.textColor = textColor
+        textView.typingAttributes = attributes
+
+        let range = NSRange(location: 0, length: (textView.string as NSString).length)
+        if range.length > 0 {
+            textView.textStorage?.setAttributes(attributes, range: range)
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -1032,6 +1098,7 @@ final class KeyHandlingTextView: NSTextView {
     var onCreateRow: (() -> Void)?
     var onIndent: (() -> Void)?
     var onOutdent: (() -> Void)?
+    var onToggleComplete: (() -> Void)?
     var onDeleteIfEmpty: (() -> Bool)?
     var onCommandFocus: (() -> Void)?
     var onBeginEditing: (() -> Void)?
@@ -1072,7 +1139,9 @@ final class KeyHandlingTextView: NSTextView {
             }
         }
 
-        if event.keyCode == 36 {
+        if isReturn(event), event.modifierFlags.contains(.command) {
+            onToggleComplete?()
+        } else if isReturn(event) {
             onCreateRow?()
         } else if isTab(event) {
             handleTab(event)
@@ -1091,6 +1160,10 @@ final class KeyHandlingTextView: NSTextView {
 
     private func isTab(_ event: NSEvent) -> Bool {
         event.keyCode == 48 || event.charactersIgnoringModifiers == "\t"
+    }
+
+    private func isReturn(_ event: NSEvent) -> Bool {
+        event.keyCode == 36
     }
 
     private func isUpArrow(_ event: NSEvent) -> Bool {
@@ -1220,6 +1293,9 @@ struct WindowTabConfigurator: NSViewRepresentable {
         func configureWindow() {
             guard let window else { return }
             window.title = title
+            window.titleVisibility = .visible
+            window.titlebarAppearsTransparent = false
+            window.styleMask.remove(.fullSizeContentView)
             window.tabbingMode = .preferred
             window.tabbingIdentifier = "SoSimpleOutlineWindow"
         }

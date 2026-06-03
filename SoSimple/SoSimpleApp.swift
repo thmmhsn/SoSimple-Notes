@@ -65,6 +65,9 @@ final class NativeTabController: NSObject, NSWindowDelegate {
 
     private func configure(_ window: NSWindow) {
         window.title = "SoSimple"
+        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = false
+        window.styleMask.remove(.fullSizeContentView)
         window.tabbingMode = .preferred
         window.tabbingIdentifier = "SoSimpleOutlineWindow"
     }
