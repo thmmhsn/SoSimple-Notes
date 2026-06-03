@@ -19,7 +19,7 @@ struct SoSimpleApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView(store: store)
+            WorkspaceView(store: store)
         }
         .commands {
             CommandGroup(after: .newItem) {
@@ -27,6 +27,11 @@ struct SoSimpleApp: App {
                     tabController.openTab(store: store)
                 }
                 .keyboardShortcut("t", modifiers: .command)
+
+                Button("Toggle Split View") {
+                    NotificationCenter.default.post(name: .toggleWorkspaceSplitView, object: nil)
+                }
+                .keyboardShortcut("\\", modifiers: [.command, .shift])
             }
         }
     }
@@ -44,7 +49,7 @@ final class NativeTabController: NSObject, NSWindowDelegate {
             defer: false
         )
         configure(window)
-        window.contentViewController = NSHostingController(rootView: ContentView(store: store))
+        window.contentViewController = NSHostingController(rootView: WorkspaceView(store: store))
         window.delegate = self
         retainedWindows.append(window)
 

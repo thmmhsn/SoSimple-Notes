@@ -373,6 +373,8 @@ final class OutlineStore: ObservableObject {
 
 struct ContentView: View {
     @ObservedObject var store: OutlineStore
+    let minimumWidth: CGFloat
+    let updatesWindowTitle: Bool
     @State private var editingItemID: UUID?
     @State private var focusedItemID: UUID?
     @State private var selectedItemIDs = Set<UUID>()
@@ -384,9 +386,19 @@ struct ContentView: View {
     @FocusState private var isFocusedTitleEditing: Bool
     @Environment(\.colorScheme) private var colorScheme
 
+    init(store: OutlineStore, minimumWidth: CGFloat = 720, updatesWindowTitle: Bool = true) {
+        self.store = store
+        self.minimumWidth = minimumWidth
+        self.updatesWindowTitle = updatesWindowTitle
+    }
+
     var body: some View {
         outlineContent
-        .background(WindowTabConfigurator(title: tabTitle))
+        .background {
+            if updatesWindowTitle {
+                WindowTabConfigurator(title: tabTitle)
+            }
+        }
         .background(colorScheme == .dark ? Color(red: 0.08, green: 0.08, blue: 0.09) : Color(nsColor: .textBackgroundColor))
         .overlay {
             ZStack {
@@ -432,7 +444,7 @@ struct ContentView: View {
         } message: {
             Text("This will delete \(pendingDeleteItemIDs.count) selected notes and their sub-notes.")
         }
-        .frame(minWidth: 720, minHeight: 520)
+        .frame(minWidth: minimumWidth, minHeight: 520)
     }
 
     private var outlineContent: some View {
@@ -715,6 +727,31 @@ struct ContentView: View {
     }
 }
 
+struct WorkspaceView: View {
+    @ObservedObject var store: OutlineStore
+    @State private var isSplitViewEnabled = false
+
+    var body: some View {
+        Group {
+            if isSplitViewEnabled {
+                HSplitView {
+                    ContentView(store: store, minimumWidth: 320, updatesWindowTitle: false)
+                    ContentView(store: store, minimumWidth: 320, updatesWindowTitle: false)
+                }
+                .background(WindowTabConfigurator(title: "Split View"))
+            } else {
+                ContentView(store: store)
+            }
+        }
+        .background(
+            WorkspaceCommandReceiver {
+                isSplitViewEnabled.toggle()
+            }
+        )
+        .frame(minWidth: 720, minHeight: 520)
+    }
+}
+
 struct OutlineRow: View {
     let item: VisibleOutlineItem
     @Binding var title: String
@@ -832,6 +869,7 @@ struct OutlineTextField: NSViewRepresentable {
 
     func makeNSView(context: Context) -> KeyHandlingTextView {
         let textView = KeyHandlingTextView()
+        textView.representedItemID = id
         textView.drawsBackground = false
         textView.isEditable = true
         textView.isSelectable = true
@@ -859,6 +897,7 @@ struct OutlineTextField: NSViewRepresentable {
 
     func updateNSView(_ textView: KeyHandlingTextView, context: Context) {
         context.coordinator.parent = self
+        textView.representedItemID = id
 
         if textView.string != text {
             textView.string = text
@@ -1093,6 +1132,7 @@ struct SelectionClearMouseMonitor: NSViewRepresentable {
 }
 
 final class KeyHandlingTextView: NSTextView {
+    var representedItemID: UUID?
     var onMoveUp: (() -> Void)?
     var onMoveDown: (() -> Void)?
     var onCreateRow: (() -> Void)?
@@ -1238,6 +1278,13 @@ struct RowKeyboardMonitor: NSViewRepresentable {
                     return event
                 }
 
+                guard
+                    let firstResponder = self.window?.firstResponder as? KeyHandlingTextView,
+                    firstResponder.representedItemID == editingItemID
+                else {
+                    return event
+                }
+
                 if event.specialKey == .upArrow || event.keyCode == 126 {
                     self.onMoveUp?(editingItemID)
                     return nil
@@ -1302,6 +1349,54 @@ struct WindowTabConfigurator: NSViewRepresentable {
     }
 }
 
+struct WorkspaceCommandReceiver: NSViewRepresentable {
+    let onToggleSplitView: () -> Void
+
+    func makeNSView(context: Context) -> ReceiverView {
+        let view = ReceiverView()
+        view.onToggleSplitView = onToggleSplitView
+        view.install()
+        return view
+    }
+
+    func updateNSView(_ view: ReceiverView, context: Context) {
+        view.onToggleSplitView = onToggleSplitView
+    }
+
+    final class ReceiverView: NSView {
+        var onToggleSplitView: (() -> Void)?
+        private var observer: NSObjectProtocol?
+
+        deinit {
+            if let observer {
+                NotificationCenter.default.removeObserver(observer)
+            }
+        }
+
+        func install() {
+            guard observer == nil else { return }
+            observer = NotificationCenter.default.addObserver(
+                forName: .toggleWorkspaceSplitView,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard
+                    let self,
+                    self.window === NSApp.keyWindow || self.window === NSApp.mainWindow
+                else {
+                    return
+                }
+
+                self.onToggleSplitView?()
+            }
+        }
+    }
+}
+
+extension Notification.Name {
+    static let toggleWorkspaceSplitView = Notification.Name("SoSimpleToggleWorkspaceSplitView")
+}
+
 #Preview {
-    ContentView(store: OutlineStore())
+    WorkspaceView(store: OutlineStore())
 }
