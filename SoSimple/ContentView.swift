@@ -39,8 +39,15 @@ private func titleHidingSupportedTags(_ title: String) -> String {
     return sidebarDisplayTitle(cleaned)
 }
 
-private func titleHidingPinMarker(_ title: String) -> String {
-    sidebarDisplayTitle(title.replacingOccurrences(of: "*", with: ""))
+private func titleHidingSidebarMarkers(_ title: String) -> String {
+    sidebarDisplayTitle(title
+        .replacingOccurrences(of: "*", with: "")
+        .replacingOccurrences(of: "~", with: "")
+    )
+}
+
+private func taskSidebarDisplayTitle(_ title: String) -> String {
+    titleHidingSidebarMarkers(titleHidingSupportedTags(title))
 }
 
 private func outlineItemsFromPasteboard(_ pasteboard: NSPasteboard) -> [OutlineItem] {
@@ -264,7 +271,7 @@ struct TaggedOutlineItem: Identifiable {
 
 private func styledInlineTagText(_ title: String, isComplete: Bool) -> AttributedString {
     var attributed = AttributedString(title.isEmpty ? "Untitled" : title)
-    attributed.font = .system(size: 16)
+    attributed.font = .system(size: 14)
     attributed.foregroundColor = isComplete ? .secondary : .primary
     if isComplete {
         attributed.strikethroughStyle = .single
@@ -1453,25 +1460,18 @@ struct PinnedNoteRow: View {
     let onOpen: () -> Void
 
     var body: some View {
-        let displayTitle = titleHidingPinMarker(title)
-        let displayProjectTitle = item.projectTitle.map(titleHidingPinMarker)
+        let displayTitle = titleHidingSidebarMarkers(title)
 
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 6))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 34, height: 20)
                 Text(styledInlineTagText(displayTitle, isComplete: isComplete))
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
-            }
-
-            if let displayProjectTitle {
-                Text(displayProjectTitle)
-                    .fontWeight(.semibold)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.gray.opacity(0.7))
-                    .lineLimit(2)
-                    .padding(.leading, 26)
-                    .padding(.top, 1)
             }
         }
         .padding(.vertical, 4)
@@ -1639,7 +1639,8 @@ struct TaggedTodoRow: View {
     let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
-        let displayTitle = titleHidingSupportedTags(title)
+        let displayTitle = taskSidebarDisplayTitle(title)
+        let displayProjectTitle = item.projectTitle.map(titleHidingSidebarMarkers)
 
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
@@ -1654,8 +1655,8 @@ struct TaggedTodoRow: View {
                     .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
             }
 
-            if let projectTitle = item.projectTitle {
-                Text(projectTitle)
+            if let displayProjectTitle {
+                Text(displayProjectTitle)
                     .fontWeight(.semibold)
                     .font(.system(size: 12))
                     .foregroundStyle(.gray.opacity(0.7))
