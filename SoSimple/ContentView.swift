@@ -20,6 +20,29 @@ private func hashtagMatches(in title: String) -> [NSTextCheckingResult] {
     return hashtagRegex.matches(in: title, range: NSRange(location: 0, length: text.length))
 }
 
+private func sidebarDisplayTitle(_ title: String) -> String {
+    let cleaned = title
+        .replacingOccurrences(of: "  ", with: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return cleaned.isEmpty ? "Untitled" : cleaned
+}
+
+private func titleHidingSupportedTags(_ title: String) -> String {
+    let text = title as NSString
+    var cleaned = title
+    for match in hashtagMatches(in: title).reversed() {
+        guard match.numberOfRanges > 1 else { continue }
+        let tag = text.substring(with: match.range(at: 1))
+        guard supportedTags.contains(tag.lowercased()) else { continue }
+        cleaned = (cleaned as NSString).replacingCharacters(in: match.range, with: "")
+    }
+    return sidebarDisplayTitle(cleaned)
+}
+
+private func titleHidingPinMarker(_ title: String) -> String {
+    sidebarDisplayTitle(title.replacingOccurrences(of: "*", with: ""))
+}
+
 private func tagTextColor(for tag: String, isComplete: Bool) -> NSColor {
     let palette: [NSColor] = [
         NSColor.systemBlue,
@@ -1240,16 +1263,19 @@ struct PinnedNoteRow: View {
     let onOpen: () -> Void
 
     var body: some View {
+        let displayTitle = titleHidingPinMarker(title)
+        let displayProjectTitle = item.projectTitle.map(titleHidingPinMarker)
+
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
-                Text(styledInlineTagText(title, isComplete: isComplete))
+                Text(styledInlineTagText(displayTitle, isComplete: isComplete))
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
             }
 
-            if let projectTitle = item.projectTitle {
-                Text(projectTitle)
+            if let displayProjectTitle {
+                Text(displayProjectTitle)
                     .fontWeight(.semibold)
                     .font(.system(size: 12))
                     .foregroundStyle(.gray.opacity(0.7))
@@ -1423,6 +1449,8 @@ struct TaggedTodoRow: View {
     let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
+        let displayTitle = titleHidingSupportedTags(title)
+
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
                 Image(systemName: "circle.fill")
@@ -1430,7 +1458,7 @@ struct TaggedTodoRow: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 34, height: 20)
 
-                Text(styledInlineTagText(title, isComplete: isComplete))
+                Text(styledInlineTagText(displayTitle, isComplete: isComplete))
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
