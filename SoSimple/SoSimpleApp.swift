@@ -32,6 +32,11 @@ struct SoSimpleApp: App {
                     NotificationCenter.default.post(name: .toggleWorkspaceSplitView, object: nil)
                 }
                 .keyboardShortcut("\\", modifiers: [.command, .shift])
+
+                Button("Toggle Tasks Sidebar") {
+                    NotificationCenter.default.post(name: .toggleWorkspaceTaskSidebar, object: nil)
+                }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
             }
         }
     }

@@ -1105,13 +1105,18 @@ struct WorkspaceView: View {
                         mainFocusRequest = id
                     }
                 )
-                .frame(minWidth: 220, idealWidth: 340, maxWidth: 340)
+                .frame(minWidth: 340, idealWidth: 340, maxWidth: 340)
             }
         }
         .background(
-            WorkspaceCommandReceiver {
-                isSplitViewEnabled.toggle()
-            }
+            WorkspaceCommandReceiver(
+                onToggleSplitView: {
+                    isSplitViewEnabled.toggle()
+                },
+                onToggleTaskSidebar: {
+                    isTaskSidebarEnabled.toggle()
+                }
+            )
         )
         .frame(minWidth: 720, minHeight: 520)
         .toolbar {
@@ -1120,7 +1125,7 @@ struct WorkspaceView: View {
             } label: {
                 Label(
                     isTaskSidebarEnabled ? "Hide Tasks" : "Show Tasks",
-                    systemImage: isTaskSidebarEnabled ? "sidebar.right" : "sidebar.right"
+                    systemImage: "checklist"
                 )
             }
             .help(isTaskSidebarEnabled ? "Hide Tasks" : "Show Tasks")
@@ -2003,50 +2008,62 @@ struct WindowTabConfigurator: NSViewRepresentable {
 
 struct WorkspaceCommandReceiver: NSViewRepresentable {
     let onToggleSplitView: () -> Void
+    let onToggleTaskSidebar: () -> Void
 
     func makeNSView(context: Context) -> ReceiverView {
         let view = ReceiverView()
         view.onToggleSplitView = onToggleSplitView
+        view.onToggleTaskSidebar = onToggleTaskSidebar
         view.install()
         return view
     }
 
     func updateNSView(_ view: ReceiverView, context: Context) {
         view.onToggleSplitView = onToggleSplitView
+        view.onToggleTaskSidebar = onToggleTaskSidebar
     }
 
     final class ReceiverView: NSView {
         var onToggleSplitView: (() -> Void)?
-        private var observer: NSObjectProtocol?
+        var onToggleTaskSidebar: (() -> Void)?
+        private var observers: [NSObjectProtocol] = []
 
         deinit {
-            if let observer {
+            for observer in observers {
                 NotificationCenter.default.removeObserver(observer)
             }
         }
 
         func install() {
-            guard observer == nil else { return }
-            observer = NotificationCenter.default.addObserver(
+            guard observers.isEmpty else { return }
+            observers.append(NotificationCenter.default.addObserver(
                 forName: .toggleWorkspaceSplitView,
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                guard
-                    let self,
-                    self.window === NSApp.keyWindow || self.window === NSApp.mainWindow
-                else {
-                    return
-                }
-
+                guard let self, self.isActiveWindow else { return }
                 self.onToggleSplitView?()
-            }
+            })
+
+            observers.append(NotificationCenter.default.addObserver(
+                forName: .toggleWorkspaceTaskSidebar,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, self.isActiveWindow else { return }
+                self.onToggleTaskSidebar?()
+            })
+        }
+
+        private var isActiveWindow: Bool {
+            window === NSApp.keyWindow || window === NSApp.mainWindow
         }
     }
 }
 
 extension Notification.Name {
     static let toggleWorkspaceSplitView = Notification.Name("SoSimpleToggleWorkspaceSplitView")
+    static let toggleWorkspaceTaskSidebar = Notification.Name("SoSimpleToggleWorkspaceTaskSidebar")
 }
 
 #Preview {
