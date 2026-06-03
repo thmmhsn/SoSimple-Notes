@@ -20,6 +20,14 @@ struct VisibleOutlineItem: Identifiable {
     let depth: Int
 }
 
+private struct RowFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [UUID: CGRect] = [:]
+
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, newValue in newValue })
+    }
+}
+
 private struct TemporaryTabbedDocument: Decodable {
     var selectedTabID: UUID?
     var tabs: [TemporaryTab]
@@ -131,6 +139,11 @@ final class OutlineStore: ObservableObject {
         }
 
         return remove(id, from: &items) != nil
+    }
+
+    func removeItems(with ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        removeItems(with: ids, from: &items)
     }
 
     func toggleExpanded(_ id: UUID) {
@@ -271,6 +284,13 @@ final class OutlineStore: ObservableObject {
         return nil
     }
 
+    private func removeItems(with ids: Set<UUID>, from source: inout [OutlineItem]) {
+        source.removeAll { ids.contains($0.id) }
+        for index in source.indices {
+            removeItems(with: ids, from: &source[index].children)
+        }
+    }
+
     private func outdent(_ id: UUID, in source: inout [OutlineItem]) -> Bool {
         for parentIndex in source.indices {
             if let childIndex = source[parentIndex].children.firstIndex(where: { $0.id == id }) {
@@ -313,6 +333,12 @@ struct ContentView: View {
     @ObservedObject var store: OutlineStore
     @State private var editingItemID: UUID?
     @State private var focusedItemID: UUID?
+    @State private var selectedItemIDs = Set<UUID>()
+    @State private var rowFrames: [UUID: CGRect] = [:]
+    @State private var selectionDragStart: CGPoint?
+    @State private var selectionDragCurrent: CGPoint?
+    @State private var isShowingDeleteSelectionConfirmation = false
+    @State private var pendingDeleteItemIDs = Set<UUID>()
     @FocusState private var isFocusedTitleEditing: Bool
     @Environment(\.colorScheme) private var colorScheme
 
@@ -321,23 +347,48 @@ struct ContentView: View {
         .background(WindowTabConfigurator(title: tabTitle))
         .background(colorScheme == .dark ? Color(red: 0.08, green: 0.08, blue: 0.09) : Color(nsColor: .textBackgroundColor))
         .overlay {
-            RowKeyboardMonitor(
-                editingItemID: $editingItemID,
-                onMoveUp: { id in
-                    if let previousID = store.previousVisibleItem(before: id, focusedItemID: focusedItemID) {
-                        editingItemID = previousID
+            ZStack {
+                SelectionClearMouseMonitor(
+                    hasSelection: !selectedItemIDs.isEmpty,
+                    isDraggingSelection: selectionDragStart != nil,
+                    onMouseDown: {
+                        clearSelection()
                     }
-                },
-                onMoveDown: { id in
-                    if let nextID = store.nextVisibleItem(after: id, focusedItemID: focusedItemID) {
-                        editingItemID = nextID
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                RowKeyboardMonitor(
+                    editingItemID: $editingItemID,
+                    selectedItemIDs: $selectedItemIDs,
+                    onMoveUp: { id in
+                        if let previousID = store.previousVisibleItem(before: id, focusedItemID: focusedItemID) {
+                            editingItemID = previousID
+                        }
+                    },
+                    onMoveDown: { id in
+                        if let nextID = store.nextVisibleItem(after: id, focusedItemID: focusedItemID) {
+                            editingItemID = nextID
+                        }
+                    },
+                    onDeleteIfEmpty: { id in
+                        deleteIfEmpty(id)
+                    },
+                    onDeleteSelection: {
+                        requestDeleteSelection()
                     }
-                },
-                onDeleteIfEmpty: { id in
-                    deleteIfEmpty(id)
-                }
-            )
-            .frame(width: 0, height: 0)
+                )
+                .frame(width: 0, height: 0)
+            }
+        }
+        .alert("Delete selected notes?", isPresented: $isShowingDeleteSelectionConfirmation) {
+            Button("Cancel", role: .cancel) {
+                pendingDeleteItemIDs = []
+            }
+            Button("Delete", role: .destructive) {
+                deletePendingSelection()
+            }
+        } message: {
+            Text("This will delete \(pendingDeleteItemIDs.count) selected notes and their sub-notes.")
         }
         .frame(minWidth: 720, minHeight: 520)
         .toolbar {
@@ -354,21 +405,22 @@ struct ContentView: View {
             header
             Divider()
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if let focusedItem {
-                        FocusedTitleTextField(
-                            text: Binding(
-                                get: { store.title(for: focusedItem.id) },
-                                set: { store.setTitle($0, for: focusedItem.id) }
-                            ),
-                            onBeginEditing: {
-                                isFocusedTitleEditing = true
-                                editingItemID = nil
-                            },
-                            onCreateRow: {
-                                addItemForCurrentView()
-                            }
-                        )
+                ZStack(alignment: .topLeading) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        if let focusedItem {
+                            FocusedTitleTextField(
+                                text: Binding(
+                                    get: { store.title(for: focusedItem.id) },
+                                    set: { store.setTitle($0, for: focusedItem.id) }
+                                ),
+                                onBeginEditing: {
+                                    isFocusedTitleEditing = true
+                                    editingItemID = nil
+                                },
+                                onCreateRow: {
+                                    addItemForCurrentView()
+                                }
+                            )
                             .onChange(of: isFocusedTitleEditing) { _, isEditing in
                                 if isEditing {
                                     editingItemID = nil
@@ -377,57 +429,98 @@ struct ContentView: View {
                             .frame(height: 34)
                             .padding(.horizontal, 8)
                             .padding(.bottom, 12)
-                    }
+                        }
 
-                    ForEach(visibleItems) { item in
-                        OutlineRow(
-                            item: item,
-                            title: Binding(
-                                get: { store.title(for: item.id) },
-                                set: { store.setTitle($0, for: item.id) }
-                            ),
-                            isExpanded: store.isExpanded(item.id),
-                            childCount: store.childCount(for: item.id),
-                            editingItemID: $editingItemID,
-                            onToggleExpanded: {
-                                store.toggleExpanded(item.id)
-                            },
-                            onFocus: {
-                                focusAndEditFirstVisible(item.id)
-                            },
-                            onAddChild: {
-                                let childID = store.addChild(to: item.id)
-                                editingItemID = childID
-                            },
-                            onMoveUp: {
-                                if let previousID = store.previousVisibleItem(before: item.id, focusedItemID: focusedItemID) {
-                                    editingItemID = previousID
+                        ForEach(visibleItems) { item in
+                            OutlineRow(
+                                item: item,
+                                title: Binding(
+                                    get: { store.title(for: item.id) },
+                                    set: { store.setTitle($0, for: item.id) }
+                                ),
+                                isExpanded: store.isExpanded(item.id),
+                                childCount: store.childCount(for: item.id),
+                                isSelected: selectedItemIDs.contains(item.id),
+                                editingItemID: $editingItemID,
+                                onToggleExpanded: {
+                                    store.toggleExpanded(item.id)
+                                },
+                                onFocus: {
+                                    focusAndEditFirstVisible(item.id)
+                                },
+                                onRowInteraction: {
+                                    clearSelection()
+                                },
+                                onAddChild: {
+                                    let childID = store.addChild(to: item.id)
+                                    editingItemID = childID
+                                },
+                                onMoveUp: {
+                                    if let previousID = store.previousVisibleItem(before: item.id, focusedItemID: focusedItemID) {
+                                        editingItemID = previousID
+                                    }
+                                },
+                                onMoveDown: {
+                                    if let nextID = store.nextVisibleItem(after: item.id, focusedItemID: focusedItemID) {
+                                        editingItemID = nextID
+                                    }
+                                },
+                                onCreateRow: {
+                                    let newID = store.addSibling(after: item.id)
+                                    editingItemID = newID
+                                },
+                                onIndent: {
+                                    store.indent(item.id, focusedItemID: focusedItemID)
+                                    editingItemID = item.id
+                                },
+                                onOutdent: {
+                                    store.outdent(item.id)
+                                    editingItemID = item.id
+                                },
+                                onDeleteIfEmpty: {
+                                    deleteIfEmpty(item.id)
                                 }
-                            },
-                            onMoveDown: {
-                                if let nextID = store.nextVisibleItem(after: item.id, focusedItemID: focusedItemID) {
-                                    editingItemID = nextID
+                            )
+                            .background(
+                                GeometryReader { proxy in
+                                    Color.clear.preference(
+                                        key: RowFramePreferenceKey.self,
+                                        value: [item.id: proxy.frame(in: .named("outlineSelection"))]
+                                    )
                                 }
-                            },
-                            onCreateRow: {
-                                let newID = store.addSibling(after: item.id)
-                                editingItemID = newID
-                            },
-                            onIndent: {
-                                store.indent(item.id, focusedItemID: focusedItemID)
-                                editingItemID = item.id
-                            },
-                            onOutdent: {
-                                store.outdent(item.id)
-                                editingItemID = item.id
-                            },
-                            onDeleteIfEmpty: {
-                                deleteIfEmpty(item.id)
-                            }
-                        )
+                            )
+                        }
+                    }
+                    .padding(24)
+
+                    if let selectionRectangle {
+                        Rectangle()
+                            .fill(Color.accentColor.opacity(0.12))
+                            .overlay(
+                                Rectangle()
+                                    .stroke(Color.accentColor.opacity(0.7), lineWidth: 1)
+                            )
+                            .frame(width: selectionRectangle.width, height: selectionRectangle.height)
+                            .position(x: selectionRectangle.midX, y: selectionRectangle.midY)
                     }
                 }
-                .padding(24)
+                .coordinateSpace(name: "outlineSelection")
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 4, coordinateSpace: .named("outlineSelection"))
+                        .onChanged { value in
+                            updateSelectionDrag(to: value.location)
+                        }
+                        .onEnded { value in
+                            updateSelectionDrag(to: value.location)
+                            selectionDragStart = nil
+                            selectionDragCurrent = nil
+                        }
+                )
+                .onPreferenceChange(RowFramePreferenceKey.self) { frames in
+                    rowFrames = frames
+                }
             }
         }
     }
@@ -437,6 +530,7 @@ struct ContentView: View {
             Button {
                 focusedItemID = nil
                 editingItemID = nil
+                selectedItemIDs = []
             } label: {
                 Image(systemName: "house")
             }
@@ -481,6 +575,7 @@ struct ContentView: View {
 
     private func focusAndEditFirstVisible(_ id: UUID) {
         isFocusedTitleEditing = false
+        selectedItemIDs = []
         focusedItemID = id
         editingItemID = visibleItems.first?.id
     }
@@ -492,6 +587,50 @@ struct ContentView: View {
         } else {
             editingItemID = store.addRoot()
         }
+    }
+
+    private func clearSelection() {
+        if !selectedItemIDs.isEmpty {
+            selectedItemIDs = []
+        }
+    }
+
+    private func requestDeleteSelection() {
+        guard selectedItemIDs.count > 1 else { return }
+        pendingDeleteItemIDs = selectedItemIDs
+        isShowingDeleteSelectionConfirmation = true
+    }
+
+    private func deletePendingSelection() {
+        store.removeItems(with: pendingDeleteItemIDs)
+        selectedItemIDs = []
+        pendingDeleteItemIDs = []
+        editingItemID = nil
+    }
+
+    private func updateSelectionDrag(to location: CGPoint) {
+        if selectionDragStart == nil {
+            selectionDragStart = location
+            editingItemID = nil
+            isFocusedTitleEditing = false
+        }
+
+        selectionDragCurrent = location
+
+        guard let selectionRectangle else {
+            selectedItemIDs = []
+            return
+        }
+
+        let visibleIDs = Set(visibleItems.map(\.id))
+        selectedItemIDs = Set(
+            rowFrames.compactMap { id, frame in
+                guard visibleIDs.contains(id), frame.intersects(selectionRectangle) else {
+                    return nil
+                }
+                return id
+            }
+        )
     }
 
     private var visibleItems: [VisibleOutlineItem] {
@@ -516,6 +655,25 @@ struct ContentView: View {
 
         return "Home"
     }
+
+    private var selectionRectangle: CGRect? {
+        guard let selectionDragStart, let selectionDragCurrent else {
+            return nil
+        }
+
+        let width = abs(selectionDragCurrent.x - selectionDragStart.x)
+        let height = abs(selectionDragCurrent.y - selectionDragStart.y)
+        guard width > 1 || height > 1 else {
+            return nil
+        }
+
+        return CGRect(
+            x: min(selectionDragStart.x, selectionDragCurrent.x),
+            y: min(selectionDragStart.y, selectionDragCurrent.y),
+            width: width,
+            height: height
+        )
+    }
 }
 
 struct OutlineRow: View {
@@ -523,10 +681,12 @@ struct OutlineRow: View {
     @Binding var title: String
     let isExpanded: Bool
     let childCount: Int
+    let isSelected: Bool
     @Binding var editingItemID: UUID?
 
     let onToggleExpanded: () -> Void
     let onFocus: () -> Void
+    let onRowInteraction: () -> Void
     let onAddChild: () -> Void
     let onMoveUp: () -> Void
     let onMoveDown: () -> Void
@@ -541,6 +701,7 @@ struct OutlineRow: View {
                 .frame(width: CGFloat(item.depth) * 28)
 
             Button {
+                onRowInteraction()
                 if NSEvent.modifierFlags.contains(.command) {
                     onFocus()
                 } else {
@@ -567,7 +728,8 @@ struct OutlineRow: View {
                 onIndent: onIndent,
                 onOutdent: onOutdent,
                 onDeleteIfEmpty: onDeleteIfEmpty,
-                onCommandFocus: onFocus
+                onCommandFocus: onFocus,
+                onBeginEditing: onRowInteraction
             )
             .frame(height: 34)
 
@@ -594,9 +756,14 @@ struct OutlineRow: View {
         .frame(height: 15, alignment: .center)
         .padding(.vertical, 6)
         .padding(.horizontal, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
+        )
         .contentShape(Rectangle())
         .simultaneousGesture(
             TapGesture().onEnded {
+                onRowInteraction()
                 if NSEvent.modifierFlags.contains(.command) {
                     onFocus()
                 }
@@ -616,6 +783,7 @@ struct OutlineTextField: NSViewRepresentable {
     let onOutdent: () -> Void
     let onDeleteIfEmpty: () -> Bool
     let onCommandFocus: () -> Void
+    let onBeginEditing: () -> Void
 
     func makeNSView(context: Context) -> KeyHandlingTextView {
         let textView = KeyHandlingTextView()
@@ -638,6 +806,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onOutdent = onOutdent
         textView.onDeleteIfEmpty = onDeleteIfEmpty
         textView.onCommandFocus = onCommandFocus
+        textView.onBeginEditing = onBeginEditing
         return textView
     }
 
@@ -655,6 +824,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onOutdent = onOutdent
         textView.onDeleteIfEmpty = onDeleteIfEmpty
         textView.onCommandFocus = onCommandFocus
+        textView.onBeginEditing = onBeginEditing
         textView.delegate = context.coordinator
 
         let shouldEdit = editingItemID == id
@@ -679,6 +849,7 @@ struct OutlineTextField: NSViewRepresentable {
         }
 
         func textDidBeginEditing(_ notification: Notification) {
+            parent.onBeginEditing()
             parent.editingItemID = parent.id
         }
 
@@ -799,6 +970,62 @@ struct FocusedTitleTextField: NSViewRepresentable {
     }
 }
 
+struct SelectionClearMouseMonitor: NSViewRepresentable {
+    let hasSelection: Bool
+    let isDraggingSelection: Bool
+    let onMouseDown: () -> Void
+
+    func makeNSView(context: Context) -> MonitorView {
+        let view = MonitorView()
+        view.install()
+        return view
+    }
+
+    func updateNSView(_ view: MonitorView, context: Context) {
+        view.hasSelection = hasSelection
+        view.isDraggingSelection = isDraggingSelection
+        view.onMouseDown = onMouseDown
+    }
+
+    final class MonitorView: NSView {
+        var hasSelection = false
+        var isDraggingSelection = false
+        var onMouseDown: (() -> Void)?
+        private var eventMonitor: Any?
+
+        deinit {
+            if let eventMonitor {
+                NSEvent.removeMonitor(eventMonitor)
+            }
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            nil
+        }
+
+        func install() {
+            guard eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+                guard
+                    let self,
+                    event.window === self.window,
+                    self.hasSelection,
+                    !self.isDraggingSelection
+                else {
+                    return event
+                }
+
+                let point = self.convert(event.locationInWindow, from: nil)
+                if self.bounds.contains(point) {
+                    self.onMouseDown?()
+                }
+
+                return event
+            }
+        }
+    }
+}
+
 final class KeyHandlingTextView: NSTextView {
     var onMoveUp: (() -> Void)?
     var onMoveDown: (() -> Void)?
@@ -807,6 +1034,7 @@ final class KeyHandlingTextView: NSTextView {
     var onOutdent: (() -> Void)?
     var onDeleteIfEmpty: (() -> Bool)?
     var onCommandFocus: (() -> Void)?
+    var onBeginEditing: (() -> Void)?
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: 34)
@@ -817,6 +1045,8 @@ final class KeyHandlingTextView: NSTextView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        onBeginEditing?()
+
         if event.modifierFlags.contains(.command) {
             onCommandFocus?()
             return
@@ -878,9 +1108,11 @@ final class KeyHandlingTextView: NSTextView {
 
 struct RowKeyboardMonitor: NSViewRepresentable {
     @Binding var editingItemID: UUID?
+    @Binding var selectedItemIDs: Set<UUID>
     let onMoveUp: (UUID) -> Void
     let onMoveDown: (UUID) -> Void
     let onDeleteIfEmpty: (UUID) -> Bool
+    let onDeleteSelection: () -> Void
 
     func makeNSView(context: Context) -> MonitorView {
         let view = MonitorView()
@@ -890,16 +1122,20 @@ struct RowKeyboardMonitor: NSViewRepresentable {
 
     func updateNSView(_ view: MonitorView, context: Context) {
         view.editingItemID = editingItemID
+        view.selectedItemIDs = selectedItemIDs
         view.onMoveUp = onMoveUp
         view.onMoveDown = onMoveDown
         view.onDeleteIfEmpty = onDeleteIfEmpty
+        view.onDeleteSelection = onDeleteSelection
     }
 
     final class MonitorView: NSView {
         var editingItemID: UUID?
+        var selectedItemIDs = Set<UUID>()
         var onMoveUp: ((UUID) -> Void)?
         var onMoveDown: ((UUID) -> Void)?
         var onDeleteIfEmpty: ((UUID) -> Bool)?
+        var onDeleteSelection: (() -> Void)?
         private var eventMonitor: Any?
 
         deinit {
@@ -913,9 +1149,19 @@ struct RowKeyboardMonitor: NSViewRepresentable {
             eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 guard
                     let self,
-                    event.window === self.window,
-                    let editingItemID = self.editingItemID
+                    event.window === self.window
                 else {
+                    return event
+                }
+
+                if event.keyCode == 51 || event.keyCode == 117 {
+                    if self.selectedItemIDs.count > 1 {
+                        self.onDeleteSelection?()
+                        return nil
+                    }
+                }
+
+                guard let editingItemID = self.editingItemID else {
                     return event
                 }
 
