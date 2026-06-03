@@ -317,7 +317,7 @@ struct ContentView: View {
 
     var body: some View {
         outlineContent
-        .background(WindowTabConfigurator())
+        .background(WindowTabConfigurator(title: tabTitle))
         .background(colorScheme == .dark ? Color(red: 0.08, green: 0.08, blue: 0.09) : Color(nsColor: .textBackgroundColor))
         .overlay {
             RowKeyboardMonitor(
@@ -477,6 +477,17 @@ struct ContentView: View {
 
     private var focusedItem: OutlineItem? {
         store.focusedItem(focusedItemID: focusedItemID)
+    }
+
+    private var tabTitle: String {
+        if let focusedItem {
+            let focusedTitle = focusedItem.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !focusedTitle.isEmpty {
+                return focusedTitle
+            }
+        }
+
+        return "Home"
     }
 }
 
@@ -834,15 +845,30 @@ struct RowKeyboardMonitor: NSViewRepresentable {
 }
 
 struct WindowTabConfigurator: NSViewRepresentable {
+    let title: String
+
     func makeNSView(context: Context) -> ConfiguringView {
-        ConfiguringView()
+        ConfiguringView(title: title)
     }
 
     func updateNSView(_ view: ConfiguringView, context: Context) {
+        view.title = title
         view.configureWindow()
     }
 
     final class ConfiguringView: NSView {
+        var title: String
+
+        init(title: String) {
+            self.title = title
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             configureWindow()
@@ -850,6 +876,7 @@ struct WindowTabConfigurator: NSViewRepresentable {
 
         func configureWindow() {
             guard let window else { return }
+            window.title = title
             window.tabbingMode = .preferred
             window.tabbingIdentifier = "SoSimpleOutlineWindow"
         }
