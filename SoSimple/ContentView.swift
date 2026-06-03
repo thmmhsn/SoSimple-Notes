@@ -1017,10 +1017,8 @@ struct TagSidebar: View {
                 .padding(.vertical, 12)
             }
 
-            Divider()
-
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
+                LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(items) { item in
                         TaggedTodoRow(
                             paneID: paneID,
@@ -1140,7 +1138,7 @@ struct TaggedTodoRow: View {
     let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 6))
@@ -1170,14 +1168,16 @@ struct TaggedTodoRow: View {
 
             if let projectTitle = item.projectTitle {
                 Text(projectTitle)
+                    .fontWeight(.semibold)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .padding(.leading, 34)
+                    .padding(.top, -6)
             }
 
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, 1)
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
@@ -1268,7 +1268,7 @@ struct OutlineRow: View {
 //            .buttonStyle(.borderless)
 //            .help("Add child")
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, 1)
         .padding(.horizontal, 8)
         .background(
             RoundedRectangle(cornerRadius: 4)
