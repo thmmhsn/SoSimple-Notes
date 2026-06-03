@@ -43,6 +43,151 @@ private func titleHidingPinMarker(_ title: String) -> String {
     sidebarDisplayTitle(title.replacingOccurrences(of: "*", with: ""))
 }
 
+private func outlineItemsFromPasteboard(_ pasteboard: NSPasteboard) -> [OutlineItem] {
+    for source in attributedPasteSources {
+        guard
+            let data = pasteboard.data(forType: source.type),
+            let attributedString = try? NSAttributedString(
+                data: data,
+                options: [
+                    .documentType: source.documentType,
+                    .characterEncoding: String.Encoding.utf8.rawValue
+                ],
+                documentAttributes: nil
+            )
+        else {
+            continue
+        }
+
+        let items = outlineItemsFromAttributedString(attributedString)
+        if !items.isEmpty {
+            return items
+        }
+    }
+
+    guard let text = pasteboard.string(forType: .string) else { return [] }
+    return outlineItemsFromPastedText(text)
+}
+
+private let attributedPasteSources: [(type: NSPasteboard.PasteboardType, documentType: NSAttributedString.DocumentType)] = [
+    (NSPasteboard.PasteboardType("public.html"), .html),
+    (.rtf, .rtf)
+]
+
+private func outlineItemsFromAttributedString(_ attributedString: NSAttributedString) -> [OutlineItem] {
+    let text = attributedString.string as NSString
+    guard text.length > 0, attributedString.string.contains("\n") else { return [] }
+    var rows: [(levelKey: Int, title: String)] = []
+
+    text.enumerateSubstrings(in: NSRange(location: 0, length: text.length), options: [.byParagraphs, .substringNotRequired]) { _, range, _, _ in
+        guard range.length > 0 else { return }
+        let paragraph = text.substring(with: range)
+        let title = stripOutlineBullet(from: paragraph)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+
+        let paragraphStyle = attributedString.attribute(.paragraphStyle, at: range.location, effectiveRange: nil) as? NSParagraphStyle
+        let indent = max(paragraphStyle?.headIndent ?? 0, paragraphStyle?.firstLineHeadIndent ?? 0)
+        rows.append((Int(indent.rounded()), title))
+    }
+
+    return outlineItems(from: rows)
+}
+
+private func outlineItemsFromPastedText(_ text: String) -> [OutlineItem] {
+    let normalizedText = text
+        .replacingOccurrences(of: "\r\n", with: "\n")
+        .replacingOccurrences(of: "\r", with: "\n")
+    guard normalizedText.contains("\n") else { return [] }
+
+    let rows = normalizedText
+        .components(separatedBy: "\n")
+        .compactMap { rawLine -> (columns: Int, title: String)? in
+            let indent = leadingIndentColumns(in: rawLine)
+            let content = rawLine.dropFirst(indent.characterCount)
+            let title = stripOutlineBullet(from: String(content))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { return nil }
+            return (indent.columns, title)
+        }
+
+    return outlineItems(from: rows.map { ($0.columns, $0.title) })
+}
+
+private func outlineItems(from rows: [(levelKey: Int, title: String)]) -> [OutlineItem] {
+    guard !rows.isEmpty else { return [] }
+    let sortedLevels = Array(Set(rows.map(\.levelKey))).sorted()
+    var roots: [OutlineItem] = []
+    var levelPaths: [[Int]] = []
+
+    for row in rows {
+        let rawLevel = sortedLevels.firstIndex(of: row.levelKey) ?? 0
+        let level = min(rawLevel, levelPaths.count)
+        let item = OutlineItem(title: row.title)
+        let path: [Int]
+
+        if level == 0 {
+            roots.append(item)
+            path = [roots.index(before: roots.endIndex)]
+        } else {
+            let parentPath = levelPaths[level - 1]
+            path = append(item, toChildrenOf: parentPath, in: &roots)
+        }
+
+        if levelPaths.count > level {
+            levelPaths.removeSubrange(level..<levelPaths.count)
+        }
+        levelPaths.append(path)
+    }
+
+    return roots
+}
+
+private func leadingIndentColumns(in line: String) -> (columns: Int, characterCount: Int) {
+    var columns = 0
+    var characterCount = 0
+    for character in line {
+        if character == "\t" {
+            columns += 4
+            characterCount += 1
+        } else if character == " " || character == "\u{00a0}" || character == "\u{2003}" {
+            columns += 1
+            characterCount += 1
+        } else {
+            break
+        }
+    }
+    return (columns, characterCount)
+}
+
+private func stripOutlineBullet(from line: String) -> String {
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+    let bullets = ["•", "◦", "▪", "‣", "⁃", "-", "–", "—"]
+    for bullet in bullets where trimmed.hasPrefix(bullet) {
+        let remainder = trimmed.dropFirst(bullet.count)
+        if remainder.first?.isWhitespace == true {
+            return String(remainder)
+        }
+    }
+    return trimmed
+}
+
+private func append(_ item: OutlineItem, toChildrenOf path: [Int], in source: inout [OutlineItem]) -> [Int] {
+    guard let firstIndex = path.first else {
+        source.append(item)
+        return [source.index(before: source.endIndex)]
+    }
+
+    if path.count == 1 {
+        source[firstIndex].isExpanded = true
+        source[firstIndex].children.append(item)
+        return path + [source[firstIndex].children.index(before: source[firstIndex].children.endIndex)]
+    }
+
+    let childPath = append(item, toChildrenOf: Array(path.dropFirst()), in: &source[firstIndex].children)
+    return [firstIndex] + childPath
+}
+
 private func tagTextColor(for tag: String, isComplete: Bool) -> NSColor {
     let palette: [NSColor] = [
         NSColor.systemBlue,
@@ -315,6 +460,32 @@ final class OutlineStore: ObservableObject {
         return child.id
     }
 
+    func pasteOutline(_ pastedItems: [OutlineItem], at id: UUID) -> UUID? {
+        guard !pastedItems.isEmpty else { return nil }
+
+        if title(for: id).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            var remainingItems = pastedItems
+            let firstItem = remainingItems.removeFirst()
+            update(id) { item in
+                item.title = firstItem.title
+                item.isExpanded = firstItem.isExpanded
+                item.isComplete = firstItem.isComplete
+                item.children = firstItem.children
+            }
+            if !remainingItems.isEmpty {
+                _ = insert(remainingItems, after: id, in: &items)
+            }
+            return id
+        }
+
+        if insert(pastedItems, after: id, in: &items) {
+            return pastedItems.first?.id
+        }
+
+        items.append(contentsOf: pastedItems)
+        return pastedItems.first?.id
+    }
+
     func indent(_ id: UUID, focusedItemID: UUID?) {
         guard let parentID = previousVisibleItem(before: id, focusedItemID: focusedItemID), let item = remove(id, from: &items) else {
             return
@@ -514,6 +685,19 @@ final class OutlineStore: ObservableObject {
                 return true
             }
             if insert(item, after: id, in: &source[index].children) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func insert(_ newItems: [OutlineItem], after id: UUID, in source: inout [OutlineItem]) -> Bool {
+        for index in source.indices {
+            if source[index].id == id {
+                source.insert(contentsOf: newItems, at: source.index(after: index))
+                return true
+            }
+            if insert(newItems, after: id, in: &source[index].children) {
                 return true
             }
         }
@@ -874,6 +1058,12 @@ struct ContentView: View {
                                 onCreateRow: {
                                     let newID = store.addSibling(after: item.id)
                                     editingItemID = newID
+                                },
+                                onPasteOutline: { pastedItems in
+                                    if let pastedID = store.pasteOutline(pastedItems, at: item.id) {
+                                        editingItemID = pastedID
+                                        collapsedItemIDs.remove(pastedID)
+                                    }
                                 },
                                 onIndent: {
                                     if let parentID = previousVisibleItem(before: item.id) {
@@ -1507,6 +1697,7 @@ struct OutlineRow: View {
     let onMoveUp: () -> Void
     let onMoveDown: () -> Void
     let onCreateRow: () -> Void
+    let onPasteOutline: ([OutlineItem]) -> Void
     let onIndent: () -> Void
     let onOutdent: () -> Void
     let onToggleComplete: () -> Void
@@ -1544,6 +1735,7 @@ struct OutlineRow: View {
                     onMoveUp: onMoveUp,
                     onMoveDown: onMoveDown,
                     onCreateRow: onCreateRow,
+                    onPasteOutline: onPasteOutline,
                     onIndent: onIndent,
                     onOutdent: onOutdent,
                     onToggleComplete: onToggleComplete,
@@ -1600,6 +1792,7 @@ struct OutlineTextField: NSViewRepresentable {
     let onMoveUp: () -> Void
     let onMoveDown: () -> Void
     let onCreateRow: () -> Void
+    let onPasteOutline: ([OutlineItem]) -> Void
     let onIndent: () -> Void
     let onOutdent: () -> Void
     let onToggleComplete: () -> Void
@@ -1627,6 +1820,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onMoveUp = onMoveUp
         textView.onMoveDown = onMoveDown
         textView.onCreateRow = onCreateRow
+        textView.onPasteOutline = onPasteOutline
         textView.onIndent = onIndent
         textView.onOutdent = onOutdent
         textView.onToggleComplete = onToggleComplete
@@ -1649,6 +1843,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.onMoveUp = onMoveUp
         textView.onMoveDown = onMoveDown
         textView.onCreateRow = onCreateRow
+        textView.onPasteOutline = onPasteOutline
         textView.onIndent = onIndent
         textView.onOutdent = onOutdent
         textView.onToggleComplete = onToggleComplete
@@ -1923,6 +2118,7 @@ final class KeyHandlingTextView: NSTextView {
     var onMoveUp: (() -> Void)?
     var onMoveDown: (() -> Void)?
     var onCreateRow: (() -> Void)?
+    var onPasteOutline: (([OutlineItem]) -> Void)?
     var onIndent: (() -> Void)?
     var onOutdent: (() -> Void)?
     var onToggleComplete: (() -> Void)?
@@ -1966,6 +2162,16 @@ final class KeyHandlingTextView: NSTextView {
         }
 
         super.mouseDown(with: event)
+    }
+
+    override func paste(_ sender: Any?) {
+        let pastedItems = outlineItemsFromPasteboard(.general)
+        guard !pastedItems.isEmpty else {
+            super.paste(sender)
+            return
+        }
+
+        onPasteOutline?(pastedItems)
     }
 
     override func keyDown(with event: NSEvent) {
