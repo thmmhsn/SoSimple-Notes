@@ -313,6 +313,7 @@ struct ContentView: View {
     @ObservedObject var store: OutlineStore
     @State private var editingItemID: UUID?
     @State private var focusedItemID: UUID?
+    @FocusState private var isFocusedTitleEditing: Bool
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
@@ -341,8 +342,7 @@ struct ContentView: View {
         .frame(minWidth: 720, minHeight: 520)
         .toolbar {
             Button {
-                let id = store.addRoot()
-                editingItemID = id
+                addItemForCurrentView()
             } label: {
                 Label("Add Item", systemImage: "plus")
             }
@@ -356,8 +356,25 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if let focusedItem {
-                        Text(focusedItem.title.isEmpty ? "Untitled" : focusedItem.title)
-                            .font(.system(size: 18, weight: .semibold))
+                        FocusedTitleTextField(
+                            text: Binding(
+                                get: { store.title(for: focusedItem.id) },
+                                set: { store.setTitle($0, for: focusedItem.id) }
+                            ),
+                            onBeginEditing: {
+                                isFocusedTitleEditing = true
+                                editingItemID = nil
+                            },
+                            onCreateRow: {
+                                addItemForCurrentView()
+                            }
+                        )
+                            .onChange(of: isFocusedTitleEditing) { _, isEditing in
+                                if isEditing {
+                                    editingItemID = nil
+                                }
+                            }
+                            .frame(height: 34)
                             .padding(.horizontal, 8)
                             .padding(.bottom, 12)
                     }
@@ -463,8 +480,18 @@ struct ContentView: View {
     }
 
     private func focusAndEditFirstVisible(_ id: UUID) {
+        isFocusedTitleEditing = false
         focusedItemID = id
         editingItemID = visibleItems.first?.id
+    }
+
+    private func addItemForCurrentView() {
+        isFocusedTitleEditing = false
+        if let focusedItemID {
+            editingItemID = store.addChild(to: focusedItemID)
+        } else {
+            editingItemID = store.addRoot()
+        }
     }
 
     private var visibleItems: [VisibleOutlineItem] {
@@ -706,6 +733,72 @@ struct OutlineTextField: NSViewRepresentable {
     }
 }
 
+struct FocusedTitleTextField: NSViewRepresentable {
+    @Binding var text: String
+    let onBeginEditing: () -> Void
+    let onCreateRow: () -> Void
+
+    func makeNSView(context: Context) -> KeyHandlingTextView {
+        let textView = KeyHandlingTextView()
+        textView.drawsBackground = false
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.allowsUndo = true
+        textView.font = .systemFont(ofSize: 18, weight: .semibold)
+        textView.textContainerInset = NSSize(width: 0, height: 6)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.maximumNumberOfLines = 1
+        textView.textContainer?.lineBreakMode = .byTruncatingTail
+        textView.delegate = context.coordinator
+        textView.onCreateRow = onCreateRow
+        return textView
+    }
+
+    func updateNSView(_ textView: KeyHandlingTextView, context: Context) {
+        context.coordinator.parent = self
+
+        if textView.string != text {
+            textView.string = text
+        }
+
+        textView.onCreateRow = onCreateRow
+        textView.delegate = context.coordinator
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: FocusedTitleTextField
+
+        init(_ parent: FocusedTitleTextField) {
+            self.parent = parent
+        }
+
+        func textDidBeginEditing(_ notification: Notification) {
+            parent.onBeginEditing()
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            parent.text = textView.string.replacingOccurrences(of: "\n", with: "")
+        }
+
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == NSSelectorFromString("insertNewline:")
+                || commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                parent.onCreateRow()
+                return true
+            }
+
+            return false
+        }
+    }
+}
+
 final class KeyHandlingTextView: NSTextView {
     var onMoveUp: (() -> Void)?
     var onMoveDown: (() -> Void)?
@@ -717,6 +810,10 @@ final class KeyHandlingTextView: NSTextView {
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: 34)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
     }
 
     override func mouseDown(with event: NSEvent) {
