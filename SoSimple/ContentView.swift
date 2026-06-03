@@ -467,6 +467,15 @@ final class OutlineStore: ObservableObject {
         return child.id
     }
 
+    func addFirstChild(to id: UUID) -> UUID {
+        let child = OutlineItem(title: "")
+        update(id) { item in
+            item.isExpanded = true
+            item.children.insert(child, at: item.children.startIndex)
+        }
+        return child.id
+    }
+
     func pasteOutline(_ pastedItems: [OutlineItem], at id: UUID) -> UUID? {
         guard !pastedItems.isEmpty else { return nil }
 
@@ -1063,8 +1072,13 @@ struct ContentView: View {
                                     }
                                 },
                                 onCreateRow: {
-                                    let newID = store.addSibling(after: item.id)
-                                    editingItemID = newID
+                                    if store.childCount(for: item.id) > 0 {
+                                        collapsedItemIDs.remove(item.id)
+                                        editingItemID = store.addFirstChild(to: item.id)
+                                    } else {
+                                        let newID = store.addSibling(after: item.id)
+                                        editingItemID = newID
+                                    }
                                 },
                                 onPasteOutline: { pastedItems in
                                     if let pastedID = store.pasteOutline(pastedItems, at: item.id) {
