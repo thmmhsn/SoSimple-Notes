@@ -7,11 +7,14 @@
 
 import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 
 private let supportedTags = ["i", "l"]
 private let taskRootTitle = "Tasks"
 private let inboxTaskTitle = "Inbox"
 private let laterTaskTitle = "Later"
+private let outlineItemDragUTType = UTType(exportedAs: "com.th.SoSimple.outline-item-id")
+private let outlineItemDropTypes = [outlineItemDragUTType, UTType.plainText]
 private let hashtagRegex = try? NSRegularExpression(pattern: #"(?<!\S)#([A-Za-z0-9_-]+)"#)
 
 private func hashtagMatches(in title: String) -> [NSTextCheckingResult] {
@@ -263,10 +266,22 @@ struct VisibleOutlineItem: Identifiable {
 
 struct TaggedOutlineItem: Identifiable {
     let id: UUID
+    let parentID: UUID?
     let title: String
     let tags: [String]
     let path: [String]
     let projectTitle: String?
+}
+
+enum OutlineDropPlacement: Equatable {
+    case before
+    case after
+    case child
+}
+
+struct OutlineDropTarget: Equatable {
+    let id: UUID
+    let placement: OutlineDropPlacement
 }
 
 private func styledInlineTagText(_ title: String, isComplete: Bool) -> AttributedString {
@@ -341,14 +356,14 @@ final class OutlineStore: ObservableObject {
     }
 
     func visibleItems(focusedItemID: UUID?) -> [VisibleOutlineItem] {
-        visibleItems(focusedItemID: focusedItemID, collapsedItemIDs: [])
+        visibleItems(focusedItemID: focusedItemID, collapsedItemIDs: [], hidesCompletedItems: false)
     }
 
-    func visibleItems(focusedItemID: UUID?, collapsedItemIDs: Set<UUID>) -> [VisibleOutlineItem] {
+    func visibleItems(focusedItemID: UUID?, collapsedItemIDs: Set<UUID>, hidesCompletedItems: Bool = false) -> [VisibleOutlineItem] {
         if let focusedItemID, let item = item(with: focusedItemID) {
-            return flatten(item.children, depth: 0, collapsedItemIDs: collapsedItemIDs)
+            return flatten(item.children, depth: 0, collapsedItemIDs: collapsedItemIDs, hidesCompletedItems: hidesCompletedItems)
         }
-        return flatten(items, depth: 0, collapsedItemIDs: collapsedItemIDs)
+        return flatten(items, depth: 0, collapsedItemIDs: collapsedItemIDs, hidesCompletedItems: hidesCompletedItems)
     }
 
     func breadcrumbs(focusedItemID: UUID?) -> [OutlineItem] {
@@ -374,14 +389,14 @@ final class OutlineStore: ObservableObject {
     }
 
     func taggedItems(filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
-        taggedItems(in: items, path: [], inheritedProjectTitle: nil, filteredBy: selectedTag)
+        taggedItems(in: items, path: [], parentID: nil, inheritedProjectTitle: nil, filteredBy: selectedTag)
     }
 
     func taskItems(filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
         let tag = selectedTag == "l" ? "l" : "i"
         let bucketItems: [TaggedOutlineItem]
         if let bucket = taskBucket(for: tag) {
-            bucketItems = taskItems(in: bucket.children, path: [bucket.title], inheritedProjectTitle: nil)
+            bucketItems = taskItems(in: bucket.children, path: [bucket.title], parentID: bucket.id, inheritedProjectTitle: nil)
         } else {
             bucketItems = []
         }
@@ -402,7 +417,7 @@ final class OutlineStore: ObservableObject {
     }
 
     func pinnedItems() -> [TaggedOutlineItem] {
-        pinnedItems(in: items, path: [], inheritedProjectTitle: nil)
+        pinnedItems(in: items, path: [], parentID: nil, inheritedProjectTitle: nil)
     }
 
     func setTitle(_ title: String, for id: UUID) {
@@ -527,12 +542,38 @@ final class OutlineStore: ObservableObject {
         _ = outdent(id, in: &items)
     }
 
+    func move(_ id: UUID, to placement: OutlineDropPlacement, relativeTo targetID: UUID) -> Bool {
+        guard id != targetID else { return false }
+        guard item(with: id)?.contains(targetID) != true else { return false }
+        guard let movedItem = remove(id, from: &items) else { return false }
+
+        let inserted: Bool
+        switch placement {
+        case .before:
+            inserted = insert(movedItem, before: targetID, in: &items)
+        case .after:
+            inserted = insert(movedItem, after: targetID, in: &items)
+        case .child:
+            inserted = insertAsChild(movedItem, of: targetID, in: &items)
+        }
+
+        if !inserted {
+            items.append(movedItem)
+        }
+
+        return inserted
+    }
+
     func removeIfEmpty(_ id: UUID) -> Bool {
         guard title(for: id).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return false
         }
 
         return remove(id, from: &items) != nil
+    }
+
+    func removeItem(with id: UUID) -> Bool {
+        remove(id, from: &items) != nil
     }
 
     func removeItems(with ids: Set<UUID>) {
@@ -707,6 +748,33 @@ final class OutlineStore: ObservableObject {
         return false
     }
 
+    private func insert(_ item: OutlineItem, before id: UUID, in source: inout [OutlineItem]) -> Bool {
+        for index in source.indices {
+            if source[index].id == id {
+                source.insert(item, at: index)
+                return true
+            }
+            if insert(item, before: id, in: &source[index].children) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func insertAsChild(_ item: OutlineItem, of id: UUID, in source: inout [OutlineItem]) -> Bool {
+        for index in source.indices {
+            if source[index].id == id {
+                source[index].isExpanded = true
+                source[index].children.append(item)
+                return true
+            }
+            if insertAsChild(item, of: id, in: &source[index].children) {
+                return true
+            }
+        }
+        return false
+    }
+
     private func insert(_ newItems: [OutlineItem], after id: UUID, in source: inout [OutlineItem]) -> Bool {
         for index in source.indices {
             if source[index].id == id {
@@ -748,7 +816,7 @@ final class OutlineStore: ObservableObject {
         }
     }
 
-    private func taggedItems(in source: [OutlineItem], path: [String], inheritedProjectTitle: String?, filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
+    private func taggedItems(in source: [OutlineItem], path: [String], parentID: UUID?, inheritedProjectTitle: String?, filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
         source.flatMap { item -> [TaggedOutlineItem] in
             let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
             let tags = parsedTags(in: title)
@@ -760,14 +828,29 @@ final class OutlineStore: ObservableObject {
             )
 
             var rows: [TaggedOutlineItem] = isIncluded
-                ? [TaggedOutlineItem(id: item.id, title: title.isEmpty ? "Untitled" : title, tags: tags, path: path, projectTitle: currentProjectTitle)]
+                ? [
+                    TaggedOutlineItem(
+                        id: item.id,
+                        parentID: parentID,
+                        title: title.isEmpty ? "Untitled" : title,
+                        tags: tags,
+                        path: path,
+                        projectTitle: currentProjectTitle
+                    )
+                ]
                 : []
-            rows.append(contentsOf: taggedItems(in: item.children, path: currentPath, inheritedProjectTitle: currentProjectTitle, filteredBy: selectedTag))
+            rows.append(contentsOf: taggedItems(
+                in: item.children,
+                path: currentPath,
+                parentID: item.id,
+                inheritedProjectTitle: currentProjectTitle,
+                filteredBy: selectedTag
+            ))
             return rows
         }
     }
 
-    private func taskItems(in source: [OutlineItem], path: [String], inheritedProjectTitle: String?) -> [TaggedOutlineItem] {
+    private func taskItems(in source: [OutlineItem], path: [String], parentID: UUID?, inheritedProjectTitle: String?) -> [TaggedOutlineItem] {
         source.flatMap { item -> [TaggedOutlineItem] in
             let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
             let displayTitle = title.isEmpty ? "Untitled" : title
@@ -776,18 +859,24 @@ final class OutlineStore: ObservableObject {
             var rows = [
                 TaggedOutlineItem(
                     id: item.id,
+                    parentID: parentID,
                     title: displayTitle,
                     tags: [],
                     path: path,
                     projectTitle: currentProjectTitle
                 )
             ]
-            rows.append(contentsOf: taskItems(in: item.children, path: currentPath, inheritedProjectTitle: currentProjectTitle))
+            rows.append(contentsOf: taskItems(
+                in: item.children,
+                path: currentPath,
+                parentID: item.id,
+                inheritedProjectTitle: currentProjectTitle
+            ))
             return rows
         }
     }
 
-    private func pinnedItems(in source: [OutlineItem], path: [String], inheritedProjectTitle: String?) -> [TaggedOutlineItem] {
+    private func pinnedItems(in source: [OutlineItem], path: [String], parentID: UUID?, inheritedProjectTitle: String?) -> [TaggedOutlineItem] {
         source.flatMap { item -> [TaggedOutlineItem] in
             let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
             let displayTitle = title.isEmpty ? "Untitled" : title
@@ -797,6 +886,7 @@ final class OutlineStore: ObservableObject {
                 ? [
                     TaggedOutlineItem(
                         id: item.id,
+                        parentID: parentID,
                         title: displayTitle,
                         tags: parsedTags(in: title),
                         path: path,
@@ -804,7 +894,12 @@ final class OutlineStore: ObservableObject {
                     )
                 ]
                 : []
-            rows.append(contentsOf: pinnedItems(in: item.children, path: currentPath, inheritedProjectTitle: currentProjectTitle))
+            rows.append(contentsOf: pinnedItems(
+                in: item.children,
+                path: currentPath,
+                parentID: item.id,
+                inheritedProjectTitle: currentProjectTitle
+            ))
             return rows
         }
     }
@@ -888,11 +983,17 @@ final class OutlineStore: ObservableObject {
         return false
     }
 
-    private func flatten(_ source: [OutlineItem], depth: Int, collapsedItemIDs: Set<UUID>) -> [VisibleOutlineItem] {
+    private func flatten(_ source: [OutlineItem], depth: Int, collapsedItemIDs: Set<UUID>, hidesCompletedItems: Bool) -> [VisibleOutlineItem] {
         source.flatMap { item -> [VisibleOutlineItem] in
-            var rows = [VisibleOutlineItem(id: item.id, depth: depth)]
-            if !collapsedItemIDs.contains(item.id) {
-                rows.append(contentsOf: flatten(item.children, depth: depth + 1, collapsedItemIDs: collapsedItemIDs))
+            let isHidden = hidesCompletedItems && item.isComplete
+            var rows = isHidden ? [] : [VisibleOutlineItem(id: item.id, depth: depth)]
+            if isHidden || !collapsedItemIDs.contains(item.id) {
+                rows.append(contentsOf: flatten(
+                    item.children,
+                    depth: isHidden ? depth : depth + 1,
+                    collapsedItemIDs: collapsedItemIDs,
+                    hidesCompletedItems: hidesCompletedItems
+                ))
             }
             return rows
         }
@@ -911,16 +1012,29 @@ final class OutlineStore: ObservableObject {
     }
 }
 
+private extension OutlineItem {
+    func contains(_ targetID: UUID) -> Bool {
+        if id == targetID {
+            return true
+        }
+
+        return children.contains { $0.contains(targetID) }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var store: OutlineStore
     let minimumWidth: CGFloat
     let updatesWindowTitle: Bool
+    let hidesCompletedItems: Bool
     @Binding private var focusRequest: UUID?
+    @Environment(\.undoManager) private var undoManager
     @State private var paneID = UUID()
     @State private var editingItemID: UUID?
     @State private var focusedItemID: UUID?
     @State private var collapsedItemIDs = Set<UUID>()
     @State private var selectedItemIDs = Set<UUID>()
+    @State private var activeDropTarget: OutlineDropTarget?
     @State private var rowFrames: [UUID: CGRect] = [:]
     @State private var selectionDragStart: CGPoint?
     @State private var selectionDragCurrent: CGPoint?
@@ -933,11 +1047,13 @@ struct ContentView: View {
         store: OutlineStore,
         minimumWidth: CGFloat = 720,
         updatesWindowTitle: Bool = true,
-        focusRequest: Binding<UUID?> = .constant(nil)
+        focusRequest: Binding<UUID?> = .constant(nil),
+        hidesCompletedItems: Bool = false
     ) {
         self.store = store
         self.minimumWidth = minimumWidth
         self.updatesWindowTitle = updatesWindowTitle
+        self.hidesCompletedItems = hidesCompletedItems
         self._focusRequest = focusRequest
     }
 
@@ -1047,6 +1163,7 @@ struct ContentView: View {
                                 isComplete: store.isComplete(item.id),
                                 isSelected: selectedItemIDs.contains(item.id),
                                 editingItemID: $editingItemID,
+                                activeDropTarget: $activeDropTarget,
                                 onToggleExpanded: {
                                     toggleExpanded(item.id)
                                 },
@@ -1072,11 +1189,14 @@ struct ContentView: View {
                                     }
                                 },
                                 onCreateRow: {
-                                    if store.childCount(for: item.id) > 0 {
+                                    if store.childCount(for: item.id) > 0 && !collapsedItemIDs.contains(item.id) {
                                         collapsedItemIDs.remove(item.id)
-                                        editingItemID = store.addFirstChild(to: item.id)
+                                        let newID = store.addFirstChild(to: item.id)
+                                        registerUndoForCreatedItem(newID)
+                                        editingItemID = newID
                                     } else {
                                         let newID = store.addSibling(after: item.id)
+                                        registerUndoForCreatedItem(newID)
                                         editingItemID = newID
                                     }
                                 },
@@ -1102,6 +1222,9 @@ struct ContentView: View {
                                 },
                                 onDeleteIfEmpty: {
                                     deleteIfEmpty(item.id)
+                                },
+                                onMoveDrop: { draggedID, placement in
+                                    moveDraggedItem(draggedID, to: placement, relativeTo: item.id)
                                 }
                             )
                             .background(
@@ -1214,9 +1337,13 @@ struct ContentView: View {
         isFocusedTitleEditing = false
         if let focusedItemID {
             collapsedItemIDs.remove(focusedItemID)
-            editingItemID = store.addChild(to: focusedItemID)
+            let newID = store.addChild(to: focusedItemID)
+            registerUndoForCreatedItem(newID)
+            editingItemID = newID
         } else {
-            editingItemID = store.addRoot()
+            let newID = store.addRoot()
+            registerUndoForCreatedItem(newID)
+            editingItemID = newID
         }
     }
 
@@ -1239,8 +1366,28 @@ struct ContentView: View {
         editingItemID = nil
     }
 
+    private func moveDraggedItem(_ id: UUID, to placement: OutlineDropPlacement, relativeTo targetID: UUID) {
+        activeDropTarget = nil
+        guard store.move(id, to: placement, relativeTo: targetID) else { return }
+        if placement == .child {
+            collapsedItemIDs.remove(targetID)
+        }
+        selectedItemIDs = []
+        editingItemID = id
+    }
+
+    private func registerUndoForCreatedItem(_ id: UUID) {
+        undoManager?.registerUndo(withTarget: store) { store in
+            Task { @MainActor in
+                _ = store.removeItem(with: id)
+            }
+        }
+        undoManager?.setActionName("New Note")
+    }
+
     private func updateSelectionDrag(to location: CGPoint) {
         if selectionDragStart == nil {
+            guard !isPointInsideRow(location) else { return }
             selectionDragStart = location
             editingItemID = nil
             isFocusedTitleEditing = false
@@ -1289,7 +1436,11 @@ struct ContentView: View {
     }
 
     private var visibleItems: [VisibleOutlineItem] {
-        store.visibleItems(focusedItemID: focusedItemID, collapsedItemIDs: collapsedItemIDs)
+        store.visibleItems(
+            focusedItemID: focusedItemID,
+            collapsedItemIDs: collapsedItemIDs,
+            hidesCompletedItems: hidesCompletedItems
+        )
     }
 
     private var breadcrumbs: [OutlineItem] {
@@ -1329,6 +1480,10 @@ struct ContentView: View {
             height: height
         )
     }
+
+    private func isPointInsideRow(_ point: CGPoint) -> Bool {
+        rowFrames.values.contains { $0.contains(point) }
+    }
 }
 
 struct WorkspaceView: View {
@@ -1336,6 +1491,7 @@ struct WorkspaceView: View {
     @State private var isSplitViewEnabled = false
     @State private var isPinnedSidebarEnabled = true
     @State private var isTaskSidebarEnabled = true
+    @State private var hidesCompletedGlobally = false
     @State private var selectedSidebarTag: String?
     @State private var mainFocusRequest: UUID?
 
@@ -1344,6 +1500,7 @@ struct WorkspaceView: View {
             if isPinnedSidebarEnabled {
                 PinnedSidebar(
                     store: store,
+                    hidesCompletedItems: hidesCompletedGlobally,
                     onOpenItem: { id in
                         mainFocusRequest = id
                     }
@@ -1358,13 +1515,23 @@ struct WorkspaceView: View {
                             store: store,
                             minimumWidth: 320,
                             updatesWindowTitle: false,
-                            focusRequest: $mainFocusRequest
+                            focusRequest: $mainFocusRequest,
+                            hidesCompletedItems: hidesCompletedGlobally
                         )
-                        ContentView(store: store, minimumWidth: 320, updatesWindowTitle: false)
+                        ContentView(
+                            store: store,
+                            minimumWidth: 320,
+                            updatesWindowTitle: false,
+                            hidesCompletedItems: hidesCompletedGlobally
+                        )
                     }
                     .background(WindowTabConfigurator(title: "Split View"))
                 } else {
-                    ContentView(store: store, focusRequest: $mainFocusRequest)
+                    ContentView(
+                        store: store,
+                        focusRequest: $mainFocusRequest,
+                        hidesCompletedItems: hidesCompletedGlobally
+                    )
                 }
             }
 
@@ -1415,6 +1582,16 @@ struct WorkspaceView: View {
             .help(isTaskSidebarEnabled ? "Hide Tasks" : "Show Tasks")
 
             Button {
+                hidesCompletedGlobally.toggle()
+            } label: {
+                Label(
+                    hidesCompletedGlobally ? "Show Done" : "Hide Done",
+                    systemImage: hidesCompletedGlobally ? "checkmark.circle.fill" : "checkmark.circle"
+                )
+            }
+            .help(hidesCompletedGlobally ? "Show completed notes globally" : "Hide completed notes globally")
+
+            Button {
                 isSplitViewEnabled.toggle()
             } label: {
                 Label(
@@ -1429,6 +1606,7 @@ struct WorkspaceView: View {
 
 struct PinnedSidebar: View {
     @ObservedObject var store: OutlineStore
+    let hidesCompletedItems: Bool
     let onOpenItem: (UUID) -> Void
     @Environment(\.colorScheme) private var colorScheme
 
@@ -1463,7 +1641,9 @@ struct PinnedSidebar: View {
     }
 
     private var items: [TaggedOutlineItem] {
-        store.pinnedItems()
+        let pinnedItems = store.pinnedItems()
+        guard hidesCompletedItems else { return pinnedItems }
+        return pinnedItems.filter { !store.isComplete($0.id) }
     }
 }
 
@@ -1509,11 +1689,14 @@ struct TagSidebar: View {
     let onOpenItem: (UUID) -> Void
     @State private var paneID = UUID()
     @State private var editingItemID: UUID?
+    @State private var hidesCompletedItems = false
+    @State private var selectedProjectTitle: String?
+    @State private var isTaskOptionsPresented = false
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
+            HStack(spacing: 10) {
                 HStack(spacing: 8) {
                     ForEach(filterOptions, id: \.tag) { option in
                         FilterChip(title: option.title, isSelected: selectedTag == option.tag) {
@@ -1526,6 +1709,11 @@ struct TagSidebar: View {
                         }
                     }
                 }
+
+                Spacer(minLength: 8)
+
+                projectFilterMenu
+                taskOptionsButton
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
@@ -1536,12 +1724,15 @@ struct TagSidebar: View {
                         TaggedTodoRow(
                             paneID: paneID,
                             item: item,
-                            title: store.title(for: item.id),
+                            title: Binding(
+                                get: { store.title(for: item.id) },
+                                set: { store.setTitle($0, for: item.id) }
+                            ),
                             isComplete: store.isComplete(item.id),
                             editingItemID: $editingItemID,
                             onOpen: {
                                 editingItemID = nil
-                                onOpenItem(item.id)
+                                onOpenItem(item.parentID ?? item.id)
                             },
                             onMoveUp: {
                                 if let previousID = previousItem(before: item.id) {
@@ -1555,6 +1746,18 @@ struct TagSidebar: View {
                             },
                             onToggleComplete: {
                                 store.toggleComplete(item.id)
+                            },
+                            onCreateRow: {
+                                let newID = store.addSibling(after: item.id)
+                                if !isBucketItem(item), let selectedTag {
+                                    store.addTag(selectedTag, to: newID)
+                                }
+                                editingItemID = newID
+                            },
+                            onPasteOutline: { pastedItems in
+                                if let pastedID = store.pasteOutline(pastedItems, at: item.id) {
+                                    editingItemID = pastedID
+                                }
                             },
                             onDeleteIfEmpty: {
                                 deleteIfEmpty(item.id)
@@ -1571,6 +1774,59 @@ struct TagSidebar: View {
                 selectedTag = "i"
             }
         }
+        .onChange(of: selectedTag) { _, _ in
+            selectedProjectTitle = nil
+        }
+    }
+
+    private var projectFilterMenu: some View {
+        Menu {
+            Button("All Projects") {
+                selectedProjectTitle = nil
+            }
+
+            if !projectOptions.isEmpty {
+                Divider()
+            }
+
+            ForEach(projectOptions, id: \.self) { projectTitle in
+                Button(titleHidingSidebarMarkers(projectTitle)) {
+                    selectedProjectTitle = projectTitle
+                }
+            }
+        } label: {
+            Label(
+                selectedProjectTitle.map(titleHidingSidebarMarkers) ?? "All Projects",
+                systemImage: "folder"
+            )
+            .font(.system(size: 12, weight: .semibold))
+            .lineLimit(1)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(maxWidth: 160, alignment: .trailing)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var taskOptionsButton: some View {
+        Button {
+            isTaskOptionsPresented.toggle()
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 26, height: 26)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Task options")
+        .popover(isPresented: $isTaskOptionsPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Hide Done", isOn: $hidesCompletedItems)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .padding(12)
+            .frame(minWidth: 150, alignment: .leading)
+        }
     }
 
     private var tags: [String] {
@@ -1585,7 +1841,27 @@ struct TagSidebar: View {
     }
 
     private var items: [TaggedOutlineItem] {
-        store.taskItems(filteredBy: selectedTag)
+        let taskItems = store.taskItems(filteredBy: selectedTag)
+        return taskItems.filter { item in
+            if hidesCompletedItems, store.isComplete(item.id) {
+                return false
+            }
+            if let selectedProjectTitle {
+                return item.projectTitle == selectedProjectTitle
+            }
+            return true
+        }
+    }
+
+    private var projectOptions: [String] {
+        Array(Set(store.taskItems(filteredBy: selectedTag).compactMap(\.projectTitle)))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func isBucketItem(_ item: TaggedOutlineItem) -> Bool {
+        guard let bucketTitle = item.path.first else { return false }
+        return bucketTitle.compare(inboxTaskTitle, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+            || bucketTitle.compare(laterTaskTitle, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
     }
 
     private func deleteIfEmpty(_ id: UUID) -> Bool {
@@ -1642,7 +1918,7 @@ struct FilterChip: View {
 struct TaggedTodoRow: View {
     let paneID: UUID
     let item: TaggedOutlineItem
-    let title: String
+    @Binding var title: String
     let isComplete: Bool
     @Binding var editingItemID: UUID?
 
@@ -1650,23 +1926,45 @@ struct TaggedTodoRow: View {
     let onMoveUp: () -> Void
     let onMoveDown: () -> Void
     let onToggleComplete: () -> Void
+    let onCreateRow: () -> Void
+    let onPasteOutline: ([OutlineItem]) -> Void
     let onDeleteIfEmpty: () -> Bool
 
     var body: some View {
-        let displayTitle = taskSidebarDisplayTitle(title)
         let displayProjectTitle = item.projectTitle.map(titleHidingSidebarMarkers)
 
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 6))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 34, height: 20)
+                Button(action: onOpen) {
+                    Image(systemName: "circle.fill")
+                        .font(.system(size: 6))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 34, height: 34)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open note")
 
-                Text(styledInlineTagText(displayTitle, isComplete: isComplete))
-                    .lineLimit(nil)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
+                OutlineTextField(
+                    paneID: paneID,
+                    id: item.id,
+                    text: $title,
+                    editingItemID: $editingItemID,
+                    onMoveUp: onMoveUp,
+                    onMoveDown: onMoveDown,
+                    onCreateRow: onCreateRow,
+                    onPasteOutline: onPasteOutline,
+                    onIndent: {},
+                    onOutdent: {},
+                    onToggleComplete: onToggleComplete,
+                    onDeleteIfEmpty: onDeleteIfEmpty,
+                    onCommandFocus: onOpen,
+                    onBeginEditing: {},
+                    wrapsText: true,
+                    isComplete: isComplete
+                )
+                .frame(minHeight: 34)
+                .frame(minWidth: 80, maxWidth: .infinity, alignment: .leading)
             }
 
             if let displayProjectTitle {
@@ -1684,14 +1982,6 @@ struct TaggedTodoRow: View {
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .onTapGesture(perform: onOpen)
-        .onHover { isHovering in
-            if isHovering {
-                NSCursor.pointingHand.push()
-            } else {
-                NSCursor.pop()
-            }
-        }
     }
 }
 
@@ -1704,6 +1994,7 @@ struct OutlineRow: View {
     let isComplete: Bool
     let isSelected: Bool
     @Binding var editingItemID: UUID?
+    @Binding var activeDropTarget: OutlineDropTarget?
 
     let onToggleExpanded: () -> Void
     let onFocus: () -> Void
@@ -1717,6 +2008,7 @@ struct OutlineRow: View {
     let onOutdent: () -> Void
     let onToggleComplete: () -> Void
     let onDeleteIfEmpty: () -> Bool
+    let onMoveDrop: (UUID, OutlineDropPlacement) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1785,8 +2077,36 @@ struct OutlineRow: View {
         .padding(.horizontal, 8)
         .background(
             RoundedRectangle(cornerRadius: 4)
-                .fill(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
+                .fill(rowBackgroundColor)
         )
+        .overlay(alignment: .top) {
+            if dropPlacement == .before {
+                dropIndicator
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if dropPlacement == .after {
+                dropIndicator
+            }
+        }
+        .onDrag {
+            editingItemID = nil
+            activeDropTarget = nil
+            return itemIDProvider(for: item.id)
+        }
+        .onDrop(
+            of: outlineItemDropTypes,
+            delegate: OutlineRowDropDelegate(
+                targetID: item.id,
+                activeDropTarget: $activeDropTarget,
+                onMoveDrop: onMoveDrop
+            )
+        )
+        .onDisappear {
+            if activeDropTarget?.id == item.id {
+                activeDropTarget = nil
+            }
+        }
         .contentShape(Rectangle())
         .simultaneousGesture(
             TapGesture().onEnded {
@@ -1796,6 +2116,135 @@ struct OutlineRow: View {
                 }
             }
         )
+    }
+
+    private var dropPlacement: OutlineDropPlacement? {
+        guard activeDropTarget?.id == item.id else { return nil }
+        return activeDropTarget?.placement
+    }
+
+    private var rowBackgroundColor: Color {
+        if dropPlacement == .child {
+            return Color.accentColor.opacity(0.12)
+        }
+        if isSelected {
+            return Color.accentColor.opacity(0.18)
+        }
+        return Color.clear
+    }
+
+    private var dropIndicator: some View {
+        Rectangle()
+            .fill(Color.accentColor)
+            .frame(height: 2)
+            .padding(.leading, CGFloat(item.depth) * 28 + 42)
+    }
+
+    private func itemIDProvider(for id: UUID) -> NSItemProvider {
+        let provider = NSItemProvider(object: id.uuidString as NSString)
+        let data = Data(id.uuidString.utf8)
+        provider.registerDataRepresentation(
+            forTypeIdentifier: outlineItemDragUTType.identifier,
+            visibility: .ownProcess
+        ) { completion in
+            completion(data, nil)
+            return nil
+        }
+        return provider
+    }
+}
+
+private struct OutlineRowDropDelegate: DropDelegate {
+    let targetID: UUID
+    @Binding var activeDropTarget: OutlineDropTarget?
+    let onMoveDrop: (UUID, OutlineDropPlacement) -> Void
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: outlineItemDropTypes)
+    }
+
+    func dropEntered(info: DropInfo) {
+        activeDropTarget = OutlineDropTarget(id: targetID, placement: placement(for: info))
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        activeDropTarget = OutlineDropTarget(id: targetID, placement: placement(for: info))
+        return DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        if activeDropTarget?.id == targetID {
+            activeDropTarget = nil
+        }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        let placement = placement(for: info)
+        activeDropTarget = nil
+
+        guard let provider = info.itemProviders(for: outlineItemDropTypes).first else {
+            return false
+        }
+
+        loadDraggedID(from: provider) { draggedID in
+            DispatchQueue.main.async {
+                onMoveDrop(draggedID, placement)
+            }
+        }
+
+        return true
+    }
+
+    private func loadDraggedID(from provider: NSItemProvider, completion: @escaping (UUID) -> Void) {
+        if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
+            loadPlainTextDraggedID(from: provider, completion: completion)
+            return
+        }
+
+        provider.loadDataRepresentation(forTypeIdentifier: outlineItemDragUTType.identifier) { data, _ in
+            guard
+                let data,
+                let rawValue = String(data: data, encoding: .utf8),
+                let draggedID = UUID(uuidString: rawValue)
+            else {
+                return
+            }
+            completion(draggedID)
+        }
+    }
+
+    private func loadPlainTextDraggedID(from provider: NSItemProvider, completion: @escaping (UUID) -> Void) {
+        provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+            let rawValue: String?
+            if let data = item as? Data {
+                rawValue = String(data: data, encoding: .utf8)
+            } else if let string = item as? String {
+                rawValue = string
+            } else if let attributedString = item as? NSAttributedString {
+                rawValue = attributedString.string
+            } else {
+                rawValue = nil
+            }
+
+            guard let rawValue, let draggedID = UUID(uuidString: rawValue) else {
+                return
+            }
+            completion(draggedID)
+        }
+    }
+
+    private func placement(for info: DropInfo) -> OutlineDropPlacement {
+        let rowHeight: CGFloat = 36
+        let topZone = rowHeight * 0.28
+        let bottomZone = rowHeight * 0.72
+
+        if info.location.y <= topZone {
+            return .before
+        }
+        if info.location.y >= bottomZone {
+            return .after
+        }
+        return .child
     }
 }
 
@@ -1852,7 +2301,7 @@ struct OutlineTextField: NSViewRepresentable {
         textView.representedItemID = id
 
         if textView.string != text {
-            textView.string = text
+            setStringWithoutUndo(text, in: textView)
         }
 
         textView.onMoveUp = onMoveUp
@@ -1932,6 +2381,18 @@ struct OutlineTextField: NSViewRepresentable {
         }
 
         return firstResponder.paneID == paneID
+    }
+
+    private func setStringWithoutUndo(_ string: String, in textView: NSTextView) {
+        let undoManager = textView.undoManager
+        let shouldReenableUndo = undoManager?.isUndoRegistrationEnabled == true
+        if shouldReenableUndo {
+            undoManager?.disableUndoRegistration()
+        }
+        textView.string = string
+        if shouldReenableUndo {
+            undoManager?.enableUndoRegistration()
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -2031,7 +2492,7 @@ struct FocusedTitleTextField: NSViewRepresentable {
         textView.paneID = paneID
 
         if textView.string != text {
-            textView.string = text
+            setStringWithoutUndo(text, in: textView)
         }
 
         textView.onCreateRow = onCreateRow
@@ -2040,6 +2501,18 @@ struct FocusedTitleTextField: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
+    }
+
+    private func setStringWithoutUndo(_ string: String, in textView: NSTextView) {
+        let undoManager = textView.undoManager
+        let shouldReenableUndo = undoManager?.isUndoRegistrationEnabled == true
+        if shouldReenableUndo {
+            undoManager?.disableUndoRegistration()
+        }
+        textView.string = string
+        if shouldReenableUndo {
+            undoManager?.enableUndoRegistration()
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
