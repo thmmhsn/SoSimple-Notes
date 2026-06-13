@@ -28,6 +28,11 @@ struct SoSimpleApp: App {
                 }
                 .keyboardShortcut("t", modifiers: .command)
 
+                Button("Search Notes") {
+                    NotificationCenter.default.post(name: .openWorkspaceSearch, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+
                 Button("Toggle Split View") {
                     NotificationCenter.default.post(name: .toggleWorkspaceSplitView, object: nil)
                 }

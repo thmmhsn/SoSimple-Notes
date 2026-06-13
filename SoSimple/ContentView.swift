@@ -273,6 +273,14 @@ struct TaggedOutlineItem: Identifiable {
     let projectTitle: String?
 }
 
+struct OutlineSearchResult: Identifiable {
+    let id: UUID
+    let title: String
+    let path: [String]
+    let isComplete: Bool
+    let searchableText: String
+}
+
 enum OutlineDropPlacement: Equatable {
     case before
     case after
@@ -383,6 +391,7 @@ final class OutlineStore: ObservableObject {
     private var childrenByID: [UUID: [OutlineItem]] = [:]
     private var taskItemsCache: [String: [TaggedOutlineItem]] = [:]
     private var pinnedItemsCache: [TaggedOutlineItem]?
+    private var searchResultsCache: [OutlineSearchResult]?
     private var pendingSaveWorkItem: DispatchWorkItem?
     private var terminationObserver: NSObjectProtocol?
     private var isLoadingItems = false
@@ -507,6 +516,51 @@ final class OutlineStore: ObservableObject {
         return items
     }
 
+    func searchResults(matching query: String, limit: Int = 60) -> [OutlineSearchResult] {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allItems = allSearchResults()
+        guard !trimmedQuery.isEmpty else {
+            return Array(allItems.prefix(limit))
+        }
+
+        let tokens = trimmedQuery
+            .lowercased()
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+        guard !tokens.isEmpty else {
+            return Array(allItems.prefix(limit))
+        }
+
+        return allItems
+            .compactMap { result -> (result: OutlineSearchResult, score: Int)? in
+                guard tokens.allSatisfy({ result.searchableText.contains($0) }) else {
+                    return nil
+                }
+
+                let title = result.title.lowercased()
+                var score = 0
+                if title.hasPrefix(trimmedQuery.lowercased()) {
+                    score += 30
+                }
+                if tokens.contains(where: { title.hasPrefix($0) }) {
+                    score += 15
+                }
+                if tokens.contains(where: { title.contains($0) }) {
+                    score += 8
+                }
+                score -= min(result.path.count, 8)
+                return (result, score)
+            }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score {
+                    return lhs.score > rhs.score
+                }
+                return lhs.result.title.localizedCaseInsensitiveCompare(rhs.result.title) == .orderedAscending
+            }
+            .prefix(limit)
+            .map(\.result)
+    }
+
     func setTitle(_ title: String, for id: UUID) {
         guard var summary = itemSummaries[id], summary.title != title else { return }
         let oldSignature = sidebarCacheSignature(for: summary.title)
@@ -527,6 +581,7 @@ final class OutlineStore: ObservableObject {
             childCount: summary.childCount
         )
         itemSummaries[id] = summary
+        searchResultsCache = nil
     }
 
     func addTag(_ rawTag: String, to id: UUID) {
@@ -690,6 +745,7 @@ final class OutlineStore: ObservableObject {
             childCount: summary.childCount
         )
         itemSummaries[id] = summary
+        searchResultsCache = nil
     }
 
     private static func makeStorageURL() -> URL {
@@ -760,6 +816,7 @@ final class OutlineStore: ObservableObject {
     private func invalidateDerivedCaches() {
         taskItemsCache.removeAll()
         pinnedItemsCache = nil
+        searchResultsCache = nil
     }
 
     private func rebuildIndexes() {
@@ -1073,6 +1130,42 @@ final class OutlineStore: ObservableObject {
                 parentID: item.id,
                 inheritedProjectTitle: currentProjectTitle,
                 into: &rows
+            )
+        }
+    }
+
+    private func allSearchResults() -> [OutlineSearchResult] {
+        if let searchResultsCache {
+            return searchResultsCache
+        }
+
+        var results: [OutlineSearchResult] = []
+        appendSearchResults(in: items, path: [], into: &results)
+        searchResultsCache = results
+        return results
+    }
+
+    private func appendSearchResults(in source: [OutlineItem], path: [String], into results: inout [OutlineSearchResult]) {
+        for item in source {
+            let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayTitle = taskSidebarDisplayTitle(title)
+            let displayPath = path.map(taskSidebarDisplayTitle)
+            let searchableText = ([title, displayTitle] + path).joined(separator: " ").lowercased()
+
+            results.append(
+                OutlineSearchResult(
+                    id: item.id,
+                    title: displayTitle,
+                    path: displayPath,
+                    isComplete: item.isComplete,
+                    searchableText: searchableText
+                )
+            )
+
+            appendSearchResults(
+                in: item.children,
+                path: path + [title.isEmpty ? "Untitled" : title],
+                into: &results
             )
         }
     }
@@ -1693,59 +1786,76 @@ struct WorkspaceView: View {
     @State private var isSplitViewEnabled = false
     @State private var isPinnedSidebarEnabled = true
     @State private var isTaskSidebarEnabled = true
+    @State private var isSearchPresented = false
     @State private var hidesCompletedGlobally = false
     @State private var selectedSidebarTag: String?
     @State private var mainFocusRequest: UUID?
 
     var body: some View {
-        HSplitView {
-            if isPinnedSidebarEnabled {
-                PinnedSidebar(
-                    store: store,
-                    hidesCompletedItems: hidesCompletedGlobally,
-                    onOpenItem: { id in
-                        mainFocusRequest = id
-                    }
-                )
-                .frame(minWidth: 220, idealWidth: 240, maxWidth: 280)
-            }
+        ZStack {
+            HSplitView {
+                if isPinnedSidebarEnabled {
+                    PinnedSidebar(
+                        store: store,
+                        hidesCompletedItems: hidesCompletedGlobally,
+                        onOpenItem: { id in
+                            mainFocusRequest = id
+                        }
+                    )
+                    .frame(minWidth: 220, idealWidth: 240, maxWidth: 280)
+                }
 
-            Group {
-                if isSplitViewEnabled {
-                    HSplitView {
+                Group {
+                    if isSplitViewEnabled {
+                        HSplitView {
+                            ContentView(
+                                store: store,
+                                minimumWidth: 320,
+                                updatesWindowTitle: false,
+                                focusRequest: $mainFocusRequest,
+                                hidesCompletedItems: hidesCompletedGlobally
+                            )
+                            ContentView(
+                                store: store,
+                                minimumWidth: 320,
+                                updatesWindowTitle: false,
+                                hidesCompletedItems: hidesCompletedGlobally
+                            )
+                        }
+                        .background(WindowTabConfigurator(title: "Split View"))
+                    } else {
                         ContentView(
                             store: store,
-                            minimumWidth: 320,
-                            updatesWindowTitle: false,
                             focusRequest: $mainFocusRequest,
                             hidesCompletedItems: hidesCompletedGlobally
                         )
-                        ContentView(
-                            store: store,
-                            minimumWidth: 320,
-                            updatesWindowTitle: false,
-                            hidesCompletedItems: hidesCompletedGlobally
-                        )
                     }
-                    .background(WindowTabConfigurator(title: "Split View"))
-                } else {
-                    ContentView(
+                }
+
+                if isTaskSidebarEnabled {
+                    TagSidebar(
                         store: store,
-                        focusRequest: $mainFocusRequest,
-                        hidesCompletedItems: hidesCompletedGlobally
+                        selectedTag: $selectedSidebarTag,
+                        onOpenItem: { id in
+                            mainFocusRequest = id
+                        }
                     )
+                    .frame(minWidth: 340, idealWidth: 340, maxWidth: 340)
                 }
             }
 
-            if isTaskSidebarEnabled {
-                TagSidebar(
+            if isSearchPresented {
+                SpotlightSearchView(
                     store: store,
-                    selectedTag: $selectedSidebarTag,
                     onOpenItem: { id in
+                        isSearchPresented = false
                         mainFocusRequest = id
+                    },
+                    onDismiss: {
+                        isSearchPresented = false
                     }
                 )
-                .frame(minWidth: 340, idealWidth: 340, maxWidth: 340)
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
             }
         }
         .background(
@@ -1758,6 +1868,9 @@ struct WorkspaceView: View {
                 },
                 onToggleTaskSidebar: {
                     isTaskSidebarEnabled.toggle()
+                },
+                onOpenSearch: {
+                    isSearchPresented = true
                 }
             )
         )
@@ -1803,6 +1916,203 @@ struct WorkspaceView: View {
             }
             .help(isSplitViewEnabled ? "Close Split View" : "Open Split View")
         }
+    }
+}
+
+struct SpotlightSearchView: View {
+    @ObservedObject var store: OutlineStore
+    let onOpenItem: (UUID) -> Void
+    let onDismiss: () -> Void
+    @State private var query = ""
+    @State private var selectedIndex = 0
+    @FocusState private var isSearchFocused: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color.black.opacity(colorScheme == .dark ? 0.28 : 0.16)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onDismiss)
+
+            VStack(spacing: 0) {
+                searchField
+
+                Divider()
+
+                resultList
+            }
+            .frame(width: 620, height: 430)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(colorScheme == .dark ? 0.32 : 0.18), radius: 28, y: 18)
+            .padding(.top, 82)
+        }
+        .background(
+            SearchKeyboardMonitor(
+                resultCount: results.count,
+                onMoveUp: {
+                    selectedIndex = max(0, selectedIndex - 1)
+                },
+                onMoveDown: {
+                    selectedIndex = min(max(results.count - 1, 0), selectedIndex + 1)
+                },
+                onOpenSelected: {
+                    openSelectedResult()
+                },
+                onDismiss: onDismiss
+            )
+            .frame(width: 0, height: 0)
+        )
+        .onAppear {
+            selectedIndex = 0
+            DispatchQueue.main.async {
+                isSearchFocused = true
+            }
+        }
+        .onChange(of: query) { _, _ in
+            selectedIndex = 0
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 24)
+
+            TextField("Search notes", text: $query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 22, weight: .regular))
+                .focused($isSearchFocused)
+                .onSubmit {
+                    openSelectedResult()
+                }
+
+            if !query.isEmpty {
+                Button {
+                    query = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear")
+            }
+        }
+        .padding(.horizontal, 18)
+        .frame(height: 62)
+    }
+
+    private var resultList: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    if results.isEmpty {
+                        emptyState
+                    } else {
+                        ForEach(Array(results.enumerated()), id: \.element.id) { index, result in
+                            SpotlightSearchRow(
+                                result: result,
+                                isSelected: index == selectedIndex,
+                                onOpen: {
+                                    onOpenItem(result.id)
+                                }
+                            )
+                            .id(result.id)
+                        }
+                    }
+                }
+                .padding(8)
+            }
+            .onChange(of: selectedIndex) { _, index in
+                guard results.indices.contains(index) else { return }
+                withAnimation(.easeOut(duration: 0.12)) {
+                    proxy.scrollTo(results[index].id, anchor: .center)
+                }
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "doc.text.magnifyingglass")
+                .font(.system(size: 28))
+                .foregroundStyle(.tertiary)
+            Text(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Start typing to search notes" : "No matching notes")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 96)
+    }
+
+    private var results: [OutlineSearchResult] {
+        store.searchResults(matching: query)
+    }
+
+    private func openSelectedResult() {
+        guard !results.isEmpty else { return }
+        let index = results.indices.contains(selectedIndex) ? selectedIndex : results.startIndex
+        onOpenItem(results[index].id)
+    }
+}
+
+struct SpotlightSearchRow: View {
+    let result: OutlineSearchResult
+    let isSelected: Bool
+    let onOpen: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 12) {
+                Image(systemName: result.isComplete ? "checkmark.circle.fill" : "doc.text")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(result.isComplete ? .secondary : .primary)
+                    .frame(width: 24)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(result.title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(result.isComplete ? .secondary : .primary)
+                        .strikethrough(result.isComplete, color: .secondary)
+                        .lineLimit(1)
+
+                    if !result.path.isEmpty {
+                        Text(result.path.joined(separator: " / "))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 12)
+
+                if isSelected {
+                    Image(systemName: "return")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 48)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(rowBackground, in: RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var rowBackground: Color {
+        if isSelected {
+            return Color.accentColor.opacity(colorScheme == .dark ? 0.26 : 0.18)
+        }
+        return Color.clear
     }
 }
 
@@ -3122,6 +3432,75 @@ struct RowKeyboardMonitor: NSViewRepresentable {
     }
 }
 
+struct SearchKeyboardMonitor: NSViewRepresentable {
+    let resultCount: Int
+    let onMoveUp: () -> Void
+    let onMoveDown: () -> Void
+    let onOpenSelected: () -> Void
+    let onDismiss: () -> Void
+
+    func makeNSView(context: Context) -> MonitorView {
+        let view = MonitorView()
+        view.install()
+        return view
+    }
+
+    func updateNSView(_ view: MonitorView, context: Context) {
+        view.resultCount = resultCount
+        view.onMoveUp = onMoveUp
+        view.onMoveDown = onMoveDown
+        view.onOpenSelected = onOpenSelected
+        view.onDismiss = onDismiss
+    }
+
+    final class MonitorView: NSView {
+        var resultCount = 0
+        var onMoveUp: (() -> Void)?
+        var onMoveDown: (() -> Void)?
+        var onOpenSelected: (() -> Void)?
+        var onDismiss: (() -> Void)?
+        private var eventMonitor: Any?
+
+        deinit {
+            if let eventMonitor {
+                NSEvent.removeMonitor(eventMonitor)
+            }
+        }
+
+        func install() {
+            guard eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard
+                    let self,
+                    event.window === self.window
+                else {
+                    return event
+                }
+
+                switch event.keyCode {
+                case 53:
+                    self.onDismiss?()
+                    return nil
+                case 126:
+                    self.onMoveUp?()
+                    return nil
+                case 125:
+                    self.onMoveDown?()
+                    return nil
+                case 36:
+                    if self.resultCount > 0 {
+                        self.onOpenSelected?()
+                        return nil
+                    }
+                    return event
+                default:
+                    return event
+                }
+            }
+        }
+    }
+}
+
 struct WindowTabConfigurator: NSViewRepresentable {
     let title: String
 
@@ -3168,12 +3547,14 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
     let onToggleSplitView: () -> Void
     let onTogglePinnedSidebar: () -> Void
     let onToggleTaskSidebar: () -> Void
+    let onOpenSearch: () -> Void
 
     func makeNSView(context: Context) -> ReceiverView {
         let view = ReceiverView()
         view.onToggleSplitView = onToggleSplitView
         view.onTogglePinnedSidebar = onTogglePinnedSidebar
         view.onToggleTaskSidebar = onToggleTaskSidebar
+        view.onOpenSearch = onOpenSearch
         view.install()
         return view
     }
@@ -3182,12 +3563,14 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
         view.onToggleSplitView = onToggleSplitView
         view.onTogglePinnedSidebar = onTogglePinnedSidebar
         view.onToggleTaskSidebar = onToggleTaskSidebar
+        view.onOpenSearch = onOpenSearch
     }
 
     final class ReceiverView: NSView {
         var onToggleSplitView: (() -> Void)?
         var onTogglePinnedSidebar: (() -> Void)?
         var onToggleTaskSidebar: (() -> Void)?
+        var onOpenSearch: (() -> Void)?
         private var observers: [NSObjectProtocol] = []
         private var keyMonitor: Any?
 
@@ -3217,6 +3600,9 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
                     return nil
                 case 124:
                     self.onToggleTaskSidebar?()
+                    return nil
+                case 3:
+                    self.onOpenSearch?()
                     return nil
                 default:
                     return event
@@ -3249,6 +3635,15 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
                 guard let self, self.isActiveWindow else { return }
                 self.onToggleTaskSidebar?()
             })
+
+            observers.append(NotificationCenter.default.addObserver(
+                forName: .openWorkspaceSearch,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, self.isActiveWindow else { return }
+                self.onOpenSearch?()
+            })
         }
 
         private var isActiveWindow: Bool {
@@ -3261,6 +3656,7 @@ extension Notification.Name {
     static let toggleWorkspaceSplitView = Notification.Name("SoSimpleToggleWorkspaceSplitView")
     static let toggleWorkspacePinnedSidebar = Notification.Name("SoSimpleToggleWorkspacePinnedSidebar")
     static let toggleWorkspaceTaskSidebar = Notification.Name("SoSimpleToggleWorkspaceTaskSidebar")
+    static let openWorkspaceSearch = Notification.Name("SoSimpleOpenWorkspaceSearch")
 }
 
 #Preview {
