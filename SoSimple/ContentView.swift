@@ -340,19 +340,79 @@ private struct TemporaryTab: Decodable {
     var items: [OutlineItem]
 }
 
+private struct OutlineItemSummary {
+    let title: String
+    let isComplete: Bool
+    let childCount: Int
+}
+
+private struct SidebarCacheSignature: Equatable {
+    let supportedTags: Set<String>
+    let isPinned: Bool
+    let projectTitle: String?
+}
+
 @MainActor
 final class OutlineStore: ObservableObject {
     @Published private(set) var items: [OutlineItem] = [] {
-        didSet { save() }
+        didSet {
+            if isApplyingIncrementalMutation {
+                if shouldInvalidateDerivedCachesAfterIncrementalMutation {
+                    invalidateDerivedCaches()
+                    shouldInvalidateDerivedCachesAfterIncrementalMutation = false
+                }
+                if !isLoadingItems {
+                    scheduleSave()
+                }
+                return
+            }
+
+            rebuildIndexes()
+            invalidateDerivedCaches()
+            if !isLoadingItems {
+                scheduleSave()
+            }
+        }
     }
 
     private let fileManager = FileManager.default
     private let storageURL: URL
+    private var itemSummaries: [UUID: OutlineItemSummary] = [:]
+    private var parentIDs = Set<UUID>()
+    private var parentByID: [UUID: UUID] = [:]
+    private var childrenByID: [UUID: [OutlineItem]] = [:]
+    private var taskItemsCache: [String: [TaggedOutlineItem]] = [:]
+    private var pinnedItemsCache: [TaggedOutlineItem]?
+    private var pendingSaveWorkItem: DispatchWorkItem?
+    private var terminationObserver: NSObjectProtocol?
+    private var isLoadingItems = false
+    private var isApplyingIncrementalMutation = false
+    private var shouldInvalidateDerivedCachesAfterIncrementalMutation = false
 
     init() {
         storageURL = Self.makeStorageURL()
+        isLoadingItems = true
         load()
         ensureTaskBuckets()
+        rebuildIndexes()
+        invalidateDerivedCaches()
+        isLoadingItems = false
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.flushPendingSave()
+            }
+        }
+    }
+
+    deinit {
+        if let terminationObserver {
+            NotificationCenter.default.removeObserver(terminationObserver)
+        }
+        pendingSaveWorkItem?.cancel()
     }
 
     func visibleItems(focusedItemID: UUID?) -> [VisibleOutlineItem] {
@@ -360,28 +420,39 @@ final class OutlineStore: ObservableObject {
     }
 
     func visibleItems(focusedItemID: UUID?, collapsedItemIDs: Set<UUID>, hidesCompletedItems: Bool = false) -> [VisibleOutlineItem] {
-        if let focusedItemID, let item = item(with: focusedItemID) {
-            return flatten(item.children, depth: 0, collapsedItemIDs: collapsedItemIDs, hidesCompletedItems: hidesCompletedItems)
+        if let focusedItemID {
+            return flatten(childrenByID[focusedItemID] ?? [], depth: 0, collapsedItemIDs: collapsedItemIDs, hidesCompletedItems: hidesCompletedItems)
         }
         return flatten(items, depth: 0, collapsedItemIDs: collapsedItemIDs, hidesCompletedItems: hidesCompletedItems)
     }
 
     func breadcrumbs(focusedItemID: UUID?) -> [OutlineItem] {
         guard let focusedItemID else { return [] }
-        return path(to: focusedItemID, in: items) ?? []
+        var ids = [UUID]()
+        var currentID: UUID? = focusedItemID
+        while let id = currentID {
+            ids.append(id)
+            currentID = parentByID[id]
+        }
+
+        return ids.reversed().compactMap { id in
+            guard let summary = itemSummaries[id] else { return nil }
+            return OutlineItem(id: id, title: summary.title, isComplete: summary.isComplete)
+        }
     }
 
     func focusedItem(focusedItemID: UUID?) -> OutlineItem? {
         guard let focusedItemID else { return nil }
-        return item(with: focusedItemID)
+        guard let summary = itemSummaries[focusedItemID] else { return nil }
+        return OutlineItem(id: focusedItemID, title: summary.title, isComplete: summary.isComplete)
+    }
+
+    func parentItemIDs() -> Set<UUID> {
+        parentIDs
     }
 
     func title(for id: UUID) -> String {
-        item(with: id)?.title ?? ""
-    }
-
-    func tags(for id: UUID) -> [String] {
-        parsedTags(in: item(with: id)?.title ?? "")
+        itemSummaries[id]?.title ?? ""
     }
 
     func allTags() -> [String] {
@@ -389,14 +460,22 @@ final class OutlineStore: ObservableObject {
     }
 
     func taggedItems(filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
-        taggedItems(in: items, path: [], parentID: nil, inheritedProjectTitle: nil, filteredBy: selectedTag)
+        var rows: [TaggedOutlineItem] = []
+        appendTaggedItems(in: items, path: [], parentID: nil, inheritedProjectTitle: nil, filteredBy: selectedTag, into: &rows)
+        return rows
     }
 
     func taskItems(filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
         let tag = selectedTag == "l" ? "l" : "i"
+        if let cachedItems = taskItemsCache[tag] {
+            return cachedItems
+        }
+
         let bucketItems: [TaggedOutlineItem]
         if let bucket = taskBucket(for: tag) {
-            bucketItems = taskItems(in: bucket.children, path: [bucket.title], parentID: bucket.id, inheritedProjectTitle: nil)
+            var rows: [TaggedOutlineItem] = []
+            appendTaskItems(in: bucket.children, path: [bucket.title], parentID: bucket.id, inheritedProjectTitle: nil, into: &rows)
+            bucketItems = rows
         } else {
             bucketItems = []
         }
@@ -408,7 +487,9 @@ final class OutlineStore: ObservableObject {
             return true
         }
 
-        return bucketItems + taggedItems
+        let items = bucketItems + taggedItems
+        taskItemsCache[tag] = items
+        return items
     }
 
     func taskBucketID(filteredBy selectedTag: String?) -> UUID? {
@@ -417,13 +498,35 @@ final class OutlineStore: ObservableObject {
     }
 
     func pinnedItems() -> [TaggedOutlineItem] {
-        pinnedItems(in: items, path: [], parentID: nil, inheritedProjectTitle: nil)
+        if let pinnedItemsCache {
+            return pinnedItemsCache
+        }
+        var items: [TaggedOutlineItem] = []
+        appendPinnedItems(in: self.items, path: [], parentID: nil, inheritedProjectTitle: nil, into: &items)
+        pinnedItemsCache = items
+        return items
     }
 
     func setTitle(_ title: String, for id: UUID) {
-        update(id) { item in
+        guard var summary = itemSummaries[id], summary.title != title else { return }
+        let oldSignature = sidebarCacheSignature(for: summary.title)
+        let newSignature = sidebarCacheSignature(for: title)
+
+        isApplyingIncrementalMutation = true
+        shouldInvalidateDerivedCachesAfterIncrementalMutation = oldSignature != newSignature || isTaskSystemTitle(summary.title) || isTaskSystemTitle(title)
+        let didUpdate = update(id) { item in
             item.title = title
         }
+        isApplyingIncrementalMutation = false
+        shouldInvalidateDerivedCachesAfterIncrementalMutation = false
+
+        guard didUpdate else { return }
+        summary = OutlineItemSummary(
+            title: title,
+            isComplete: summary.isComplete,
+            childCount: summary.childCount
+        )
+        itemSummaries[id] = summary
     }
 
     func addTag(_ rawTag: String, to id: UUID) {
@@ -432,30 +535,23 @@ final class OutlineStore: ObservableObject {
             return
         }
 
-        update(id) { item in
-            guard !parsedTags(in: item.title).contains(where: { $0.compare(resolvedTag, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }) else {
-                return
-            }
-            item.title = item.title.trimmingCharacters(in: .whitespaces) + " #\(resolvedTag)"
+        let currentTitle = title(for: id)
+        guard !parsedTags(in: currentTitle).contains(where: { $0.compare(resolvedTag, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }) else {
+            return
         }
+        setTitle(currentTitle.trimmingCharacters(in: .whitespaces) + " #\(resolvedTag)", for: id)
     }
 
     func removeTag(_ tag: String, from id: UUID) {
-        update(id) { item in
-            item.title = removeHashtag(tag, from: item.title)
-        }
-    }
-
-    func isExpanded(_ id: UUID) -> Bool {
-        item(with: id)?.isExpanded ?? false
+        setTitle(removeHashtag(tag, from: title(for: id)), for: id)
     }
 
     func isComplete(_ id: UUID) -> Bool {
-        item(with: id)?.isComplete ?? false
+        itemSummaries[id]?.isComplete ?? false
     }
 
     func childCount(for id: UUID) -> Int {
-        item(with: id)?.children.count ?? 0
+        itemSummaries[id]?.childCount ?? 0
     }
 
     func addRoot() -> UUID {
@@ -517,17 +613,6 @@ final class OutlineStore: ObservableObject {
         return pastedItems.first?.id
     }
 
-    func indent(_ id: UUID, focusedItemID: UUID?) {
-        guard let parentID = previousVisibleItem(before: id, focusedItemID: focusedItemID), let item = remove(id, from: &items) else {
-            return
-        }
-
-        update(parentID) { parent in
-            parent.isExpanded = true
-            parent.children.append(item)
-        }
-    }
-
     func indent(_ id: UUID, under parentID: UUID) {
         guard let item = remove(id, from: &items) else {
             return
@@ -544,7 +629,7 @@ final class OutlineStore: ObservableObject {
 
     func move(_ id: UUID, to placement: OutlineDropPlacement, relativeTo targetID: UUID) -> Bool {
         guard id != targetID else { return false }
-        guard item(with: id)?.contains(targetID) != true else { return false }
+        guard !isAncestor(id, of: targetID) else { return false }
         guard let movedItem = remove(id, from: &items) else { return false }
 
         let inserted: Bool
@@ -588,25 +673,23 @@ final class OutlineStore: ObservableObject {
     }
 
     func toggleComplete(_ id: UUID) {
-        update(id) { item in
+        guard var summary = itemSummaries[id] else { return }
+
+        isApplyingIncrementalMutation = true
+        shouldInvalidateDerivedCachesAfterIncrementalMutation = false
+        let didUpdate = update(id) { item in
             item.isComplete.toggle()
         }
-    }
+        isApplyingIncrementalMutation = false
+        shouldInvalidateDerivedCachesAfterIncrementalMutation = false
 
-    func nextVisibleItem(after id: UUID, focusedItemID: UUID?) -> UUID? {
-        let ids = visibleItems(focusedItemID: focusedItemID).map(\.id)
-        guard let index = ids.firstIndex(of: id), index < ids.index(before: ids.endIndex) else {
-            return nil
-        }
-        return ids[ids.index(after: index)]
-    }
-
-    func previousVisibleItem(before id: UUID, focusedItemID: UUID?) -> UUID? {
-        let ids = visibleItems(focusedItemID: focusedItemID).map(\.id)
-        guard let index = ids.firstIndex(of: id), index > ids.startIndex else {
-            return nil
-        }
-        return ids[ids.index(before: index)]
+        guard didUpdate else { return }
+        summary = OutlineItemSummary(
+            title: summary.title,
+            isComplete: !summary.isComplete,
+            childCount: summary.childCount
+        )
+        itemSummaries[id] = summary
     }
 
     private static func makeStorageURL() -> URL {
@@ -658,6 +741,78 @@ final class OutlineStore: ObservableObject {
         }
     }
 
+    private func scheduleSave() {
+        pendingSaveWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.save()
+            self?.pendingSaveWorkItem = nil
+        }
+        pendingSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: workItem)
+    }
+
+    private func flushPendingSave() {
+        pendingSaveWorkItem?.cancel()
+        pendingSaveWorkItem = nil
+        save()
+    }
+
+    private func invalidateDerivedCaches() {
+        taskItemsCache.removeAll()
+        pinnedItemsCache = nil
+    }
+
+    private func rebuildIndexes() {
+        var summaries: [UUID: OutlineItemSummary] = [:]
+        var parents = Set<UUID>()
+        var parentMap: [UUID: UUID] = [:]
+        var childMap: [UUID: [OutlineItem]] = [:]
+        rebuildIndexes(
+            in: items,
+            parentID: nil,
+            summaries: &summaries,
+            parentIDs: &parents,
+            parentByID: &parentMap,
+            childrenByID: &childMap
+        )
+        itemSummaries = summaries
+        parentIDs = parents
+        parentByID = parentMap
+        childrenByID = childMap
+    }
+
+    private func rebuildIndexes(
+        in source: [OutlineItem],
+        parentID: UUID?,
+        summaries: inout [UUID: OutlineItemSummary],
+        parentIDs: inout Set<UUID>,
+        parentByID: inout [UUID: UUID],
+        childrenByID: inout [UUID: [OutlineItem]]
+    ) {
+        for item in source {
+            summaries[item.id] = OutlineItemSummary(
+                title: item.title,
+                isComplete: item.isComplete,
+                childCount: item.children.count
+            )
+            childrenByID[item.id] = item.children
+            if !item.children.isEmpty {
+                parentIDs.insert(item.id)
+            }
+            if let parentID {
+                parentByID[item.id] = parentID
+            }
+            rebuildIndexes(
+                in: item.children,
+                parentID: item.id,
+                summaries: &summaries,
+                parentIDs: &parentIDs,
+                parentByID: &parentByID,
+                childrenByID: &childrenByID
+            )
+        }
+    }
+
     private func loadDefaultItems() {
         items = [
             OutlineItem(
@@ -705,34 +860,40 @@ final class OutlineStore: ObservableObject {
             .compare(expectedTitle, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
     }
 
-    private func item(with id: UUID) -> OutlineItem? {
-        find(id, in: items)
+    private func isTaskSystemTitle(_ title: String) -> Bool {
+        isTitle(title, equalTo: taskRootTitle)
+            || isTitle(title, equalTo: inboxTaskTitle)
+            || isTitle(title, equalTo: laterTaskTitle)
     }
 
-    private func find(_ id: UUID, in source: [OutlineItem]) -> OutlineItem? {
-        for item in source {
-            if item.id == id {
-                return item
+    private func isAncestor(_ possibleAncestorID: UUID, of id: UUID) -> Bool {
+        var currentID = parentByID[id]
+        while let parentID = currentID {
+            if parentID == possibleAncestorID {
+                return true
             }
-            if let match = find(id, in: item.children) {
-                return match
-            }
+            currentID = parentByID[parentID]
         }
-        return nil
+        return false
     }
 
-    private func update(_ id: UUID, _ change: (inout OutlineItem) -> Void) {
+    @discardableResult
+    private func update(_ id: UUID, _ change: (inout OutlineItem) -> Void) -> Bool {
         update(id, in: &items, change)
     }
 
-    private func update(_ id: UUID, in source: inout [OutlineItem], _ change: (inout OutlineItem) -> Void) {
+    @discardableResult
+    private func update(_ id: UUID, in source: inout [OutlineItem], _ change: (inout OutlineItem) -> Void) -> Bool {
         for index in source.indices {
             if source[index].id == id {
                 change(&source[index])
-                return
+                return true
             }
-            update(id, in: &source[index].children, change)
+            if update(id, in: &source[index].children, change) {
+                return true
+            }
         }
+        return false
     }
 
     private func insert(_ item: OutlineItem, after id: UUID, in source: inout [OutlineItem]) -> Bool {
@@ -807,56 +968,62 @@ final class OutlineStore: ObservableObject {
         }
     }
 
-    private func collectTags(from source: [OutlineItem], into tags: inout Set<String>) {
+    private func appendTaggedItems(
+        in source: [OutlineItem],
+        path: [String],
+        parentID: UUID?,
+        inheritedProjectTitle: String?,
+        filteredBy selectedTag: String?,
+        into rows: inout [TaggedOutlineItem]
+    ) {
         for item in source {
-            for tag in parsedTags(in: item.title) {
-                tags.insert(tag)
-            }
-            collectTags(from: item.children, into: &tags)
-        }
-    }
-
-    private func taggedItems(in source: [OutlineItem], path: [String], parentID: UUID?, inheritedProjectTitle: String?, filteredBy selectedTag: String?) -> [TaggedOutlineItem] {
-        source.flatMap { item -> [TaggedOutlineItem] in
             let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
             let tags = parsedTags(in: title)
-            let currentPath = path + [title.isEmpty ? "Untitled" : title]
+            let displayTitle = title.isEmpty ? "Untitled" : title
+            let currentPath = path + [displayTitle]
             let currentProjectTitle = projectTitle(in: title) ?? inheritedProjectTitle
             let isIncluded = !tags.isEmpty && (
                 selectedTag == nil ||
                 tags.contains { $0.compare(selectedTag ?? "", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
             )
 
-            var rows: [TaggedOutlineItem] = isIncluded
-                ? [
+            if isIncluded {
+                rows.append(
                     TaggedOutlineItem(
                         id: item.id,
                         parentID: parentID,
-                        title: title.isEmpty ? "Untitled" : title,
+                        title: displayTitle,
                         tags: tags,
                         path: path,
                         projectTitle: currentProjectTitle
                     )
-                ]
-                : []
-            rows.append(contentsOf: taggedItems(
+                )
+            }
+
+            appendTaggedItems(
                 in: item.children,
                 path: currentPath,
                 parentID: item.id,
                 inheritedProjectTitle: currentProjectTitle,
-                filteredBy: selectedTag
-            ))
-            return rows
+                filteredBy: selectedTag,
+                into: &rows
+            )
         }
     }
 
-    private func taskItems(in source: [OutlineItem], path: [String], parentID: UUID?, inheritedProjectTitle: String?) -> [TaggedOutlineItem] {
-        source.flatMap { item -> [TaggedOutlineItem] in
+    private func appendTaskItems(
+        in source: [OutlineItem],
+        path: [String],
+        parentID: UUID?,
+        inheritedProjectTitle: String?,
+        into rows: inout [TaggedOutlineItem]
+    ) {
+        for item in source {
             let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
             let displayTitle = title.isEmpty ? "Untitled" : title
             let currentPath = path + [displayTitle]
             let currentProjectTitle = projectTitle(in: title) ?? inheritedProjectTitle
-            var rows = [
+            rows.append(
                 TaggedOutlineItem(
                     id: item.id,
                     parentID: parentID,
@@ -865,25 +1032,31 @@ final class OutlineStore: ObservableObject {
                     path: path,
                     projectTitle: currentProjectTitle
                 )
-            ]
-            rows.append(contentsOf: taskItems(
+            )
+            appendTaskItems(
                 in: item.children,
                 path: currentPath,
                 parentID: item.id,
-                inheritedProjectTitle: currentProjectTitle
-            ))
-            return rows
+                inheritedProjectTitle: currentProjectTitle,
+                into: &rows
+            )
         }
     }
 
-    private func pinnedItems(in source: [OutlineItem], path: [String], parentID: UUID?, inheritedProjectTitle: String?) -> [TaggedOutlineItem] {
-        source.flatMap { item -> [TaggedOutlineItem] in
+    private func appendPinnedItems(
+        in source: [OutlineItem],
+        path: [String],
+        parentID: UUID?,
+        inheritedProjectTitle: String?,
+        into rows: inout [TaggedOutlineItem]
+    ) {
+        for item in source {
             let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
             let displayTitle = title.isEmpty ? "Untitled" : title
             let currentPath = path + [displayTitle]
             let currentProjectTitle = projectTitle(in: title) ?? inheritedProjectTitle
-            var rows: [TaggedOutlineItem] = title.contains("*")
-                ? [
+            if title.contains("*") {
+                rows.append(
                     TaggedOutlineItem(
                         id: item.id,
                         parentID: parentID,
@@ -892,15 +1065,15 @@ final class OutlineStore: ObservableObject {
                         path: path,
                         projectTitle: currentProjectTitle
                     )
-                ]
-                : []
-            rows.append(contentsOf: pinnedItems(
+                )
+            }
+            appendPinnedItems(
                 in: item.children,
                 path: currentPath,
                 parentID: item.id,
-                inheritedProjectTitle: currentProjectTitle
-            ))
-            return rows
+                inheritedProjectTitle: currentProjectTitle,
+                into: &rows
+            )
         }
     }
 
@@ -914,6 +1087,14 @@ final class OutlineStore: ObservableObject {
             .replacingOccurrences(of: "  ", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return projectTitle.isEmpty ? nil : projectTitle
+    }
+
+    private func sidebarCacheSignature(for title: String) -> SidebarCacheSignature {
+        SidebarCacheSignature(
+            supportedTags: Set(parsedTags(in: title).filter { supportedTags.contains($0.lowercased()) }),
+            isPinned: title.contains("*"),
+            projectTitle: projectTitle(in: title)
+        )
     }
 
     private func normalizedTag(_ rawTag: String) -> String? {
@@ -984,41 +1165,40 @@ final class OutlineStore: ObservableObject {
     }
 
     private func flatten(_ source: [OutlineItem], depth: Int, collapsedItemIDs: Set<UUID>, hidesCompletedItems: Bool) -> [VisibleOutlineItem] {
-        source.flatMap { item -> [VisibleOutlineItem] in
-            let isHidden = hidesCompletedItems && item.isComplete
-            var rows = isHidden ? [] : [VisibleOutlineItem(id: item.id, depth: depth)]
+        var rows: [VisibleOutlineItem] = []
+        rows.reserveCapacity(source.count)
+        appendVisibleItems(
+            from: source,
+            depth: depth,
+            collapsedItemIDs: collapsedItemIDs,
+            hidesCompletedItems: hidesCompletedItems,
+            into: &rows
+        )
+        return rows
+    }
+
+    private func appendVisibleItems(
+        from source: [OutlineItem],
+        depth: Int,
+        collapsedItemIDs: Set<UUID>,
+        hidesCompletedItems: Bool,
+        into rows: inout [VisibleOutlineItem]
+    ) {
+        for item in source {
+            let isHidden = hidesCompletedItems && isComplete(item.id)
+            if !isHidden {
+                rows.append(VisibleOutlineItem(id: item.id, depth: depth))
+            }
             if isHidden || !collapsedItemIDs.contains(item.id) {
-                rows.append(contentsOf: flatten(
-                    item.children,
+                appendVisibleItems(
+                    from: childrenByID[item.id] ?? item.children,
                     depth: isHidden ? depth : depth + 1,
                     collapsedItemIDs: collapsedItemIDs,
-                    hidesCompletedItems: hidesCompletedItems
-                ))
-            }
-            return rows
-        }
-    }
-
-    private func path(to id: UUID, in source: [OutlineItem]) -> [OutlineItem]? {
-        for item in source {
-            if item.id == id {
-                return [item]
-            }
-            if let childPath = path(to: id, in: item.children) {
-                return [item] + childPath
+                    hidesCompletedItems: hidesCompletedItems,
+                    into: &rows
+                )
             }
         }
-        return nil
-    }
-}
-
-private extension OutlineItem {
-    func contains(_ targetID: UUID) -> Bool {
-        if id == targetID {
-            return true
-        }
-
-        return children.contains { $0.contains(targetID) }
     }
 }
 
@@ -1035,6 +1215,8 @@ struct ContentView: View {
     @State private var collapsedItemIDs = Set<UUID>()
     @State private var selectedItemIDs = Set<UUID>()
     @State private var activeDropTarget: OutlineDropTarget?
+    @State private var draggedItemID: UUID?
+    @State private var hasInitializedCollapsedItems = false
     @State private var rowFrames: [UUID: CGRect] = [:]
     @State private var selectionDragStart: CGPoint?
     @State private var selectionDragCurrent: CGPoint?
@@ -1098,6 +1280,15 @@ struct ContentView: View {
                     }
                 )
                 .frame(width: 0, height: 0)
+
+                DropStateMouseUpMonitor(
+                    isActive: draggedItemID != nil || activeDropTarget != nil,
+                    onMouseUp: {
+                        activeDropTarget = nil
+                        draggedItemID = nil
+                    }
+                )
+                .frame(width: 0, height: 0)
             }
         }
         .alert("Delete selected notes?", isPresented: $isShowingDeleteSelectionConfirmation) {
@@ -1114,6 +1305,9 @@ struct ContentView: View {
             guard let requestedID else { return }
             focusItem(requestedID)
             focusRequest = nil
+        }
+        .onAppear {
+            initializeCollapsedItemsIfNeeded()
         }
         .frame(minWidth: minimumWidth, minHeight: 520)
     }
@@ -1164,6 +1358,7 @@ struct ContentView: View {
                                 isSelected: selectedItemIDs.contains(item.id),
                                 editingItemID: $editingItemID,
                                 activeDropTarget: $activeDropTarget,
+                                draggedItemID: $draggedItemID,
                                 onToggleExpanded: {
                                     toggleExpanded(item.id)
                                 },
@@ -1368,6 +1563,7 @@ struct ContentView: View {
 
     private func moveDraggedItem(_ id: UUID, to placement: OutlineDropPlacement, relativeTo targetID: UUID) {
         activeDropTarget = nil
+        draggedItemID = nil
         guard store.move(id, to: placement, relativeTo: targetID) else { return }
         if placement == .child {
             collapsedItemIDs.remove(targetID)
@@ -1417,6 +1613,12 @@ struct ContentView: View {
         } else {
             collapsedItemIDs.insert(id)
         }
+    }
+
+    private func initializeCollapsedItemsIfNeeded() {
+        guard !hasInitializedCollapsedItems else { return }
+        collapsedItemIDs = store.parentItemIDs()
+        hasInitializedCollapsedItems = true
     }
 
     private func nextVisibleItem(after id: UUID) -> UUID? {
@@ -1995,6 +2197,7 @@ struct OutlineRow: View {
     let isSelected: Bool
     @Binding var editingItemID: UUID?
     @Binding var activeDropTarget: OutlineDropTarget?
+    @Binding var draggedItemID: UUID?
 
     let onToggleExpanded: () -> Void
     let onFocus: () -> Void
@@ -2020,7 +2223,7 @@ struct OutlineRow: View {
                     onRowInteraction()
                     if NSEvent.modifierFlags.contains(.command) {
                         onFocus()
-                    } else {
+                    } else if childCount > 0 {
                         onToggleExpanded()
                     }
                 } label: {
@@ -2032,7 +2235,9 @@ struct OutlineRow: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(childCount == 0)
+                .onDrag {
+                    beginDragProvider(for: item.id)
+                }
                 
                 OutlineTextField(
                     paneID: paneID,
@@ -2090,21 +2295,23 @@ struct OutlineRow: View {
             }
         }
         .onDrag {
-            editingItemID = nil
-            activeDropTarget = nil
-            return itemIDProvider(for: item.id)
+            beginDragProvider(for: item.id)
         }
         .onDrop(
             of: outlineItemDropTypes,
             delegate: OutlineRowDropDelegate(
                 targetID: item.id,
                 activeDropTarget: $activeDropTarget,
+                draggedItemID: $draggedItemID,
                 onMoveDrop: onMoveDrop
             )
         )
         .onDisappear {
             if activeDropTarget?.id == item.id {
                 activeDropTarget = nil
+            }
+            if draggedItemID == item.id {
+                draggedItemID = nil
             }
         }
         .contentShape(Rectangle())
@@ -2152,23 +2359,38 @@ struct OutlineRow: View {
         }
         return provider
     }
+
+    private func beginDragProvider(for id: UUID) -> NSItemProvider {
+        editingItemID = nil
+        activeDropTarget = nil
+        draggedItemID = id
+        return itemIDProvider(for: id)
+    }
 }
 
 private struct OutlineRowDropDelegate: DropDelegate {
     let targetID: UUID
     @Binding var activeDropTarget: OutlineDropTarget?
+    @Binding var draggedItemID: UUID?
     let onMoveDrop: (UUID, OutlineDropPlacement) -> Void
 
     func validateDrop(info: DropInfo) -> Bool {
-        info.hasItemsConforming(to: outlineItemDropTypes)
+        canDrop(info: info)
     }
 
     func dropEntered(info: DropInfo) {
-        activeDropTarget = OutlineDropTarget(id: targetID, placement: placement(for: info))
+        updateDropTarget(for: info)
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        activeDropTarget = OutlineDropTarget(id: targetID, placement: placement(for: info))
+        guard canDrop(info: info) else {
+            if activeDropTarget?.id == targetID {
+                activeDropTarget = nil
+            }
+            return DropProposal(operation: .cancel)
+        }
+
+        updateDropTarget(for: info)
         return DropProposal(operation: .move)
     }
 
@@ -2182,12 +2404,21 @@ private struct OutlineRowDropDelegate: DropDelegate {
         let placement = placement(for: info)
         activeDropTarget = nil
 
+        if let draggedItemID {
+            self.draggedItemID = nil
+            guard draggedItemID != targetID else { return false }
+            onMoveDrop(draggedItemID, placement)
+            return true
+        }
+
         guard let provider = info.itemProviders(for: outlineItemDropTypes).first else {
+            draggedItemID = nil
             return false
         }
 
         loadDraggedID(from: provider) { draggedID in
             DispatchQueue.main.async {
+                self.draggedItemID = nil
                 onMoveDrop(draggedID, placement)
             }
         }
@@ -2195,8 +2426,26 @@ private struct OutlineRowDropDelegate: DropDelegate {
         return true
     }
 
+    private func canDrop(info: DropInfo) -> Bool {
+        if let draggedItemID {
+            return draggedItemID != targetID
+        }
+        return info.hasItemsConforming(to: outlineItemDropTypes)
+    }
+
+    private func updateDropTarget(for info: DropInfo) {
+        guard canDrop(info: info) else {
+            if activeDropTarget?.id == targetID {
+                activeDropTarget = nil
+            }
+            return
+        }
+
+        activeDropTarget = OutlineDropTarget(id: targetID, placement: placement(for: info))
+    }
+
     private func loadDraggedID(from provider: NSItemProvider, completion: @escaping (UUID) -> Void) {
-        if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
+        guard provider.hasItemConformingToTypeIdentifier(outlineItemDragUTType.identifier) else {
             loadPlainTextDraggedID(from: provider, completion: completion)
             return
         }
@@ -2207,6 +2456,7 @@ private struct OutlineRowDropDelegate: DropDelegate {
                 let rawValue = String(data: data, encoding: .utf8),
                 let draggedID = UUID(uuidString: rawValue)
             else {
+                loadPlainTextDraggedID(from: provider, completion: completion)
                 return
             }
             completion(draggedID)
@@ -2591,6 +2841,57 @@ struct SelectionClearMouseMonitor: NSViewRepresentable {
                 let point = self.convert(event.locationInWindow, from: nil)
                 if self.bounds.contains(point) {
                     self.onMouseDown?()
+                }
+
+                return event
+            }
+        }
+    }
+}
+
+struct DropStateMouseUpMonitor: NSViewRepresentable {
+    let isActive: Bool
+    let onMouseUp: () -> Void
+
+    func makeNSView(context: Context) -> MonitorView {
+        let view = MonitorView()
+        view.install()
+        return view
+    }
+
+    func updateNSView(_ view: MonitorView, context: Context) {
+        view.isActive = isActive
+        view.onMouseUp = onMouseUp
+    }
+
+    final class MonitorView: NSView {
+        var isActive = false
+        var onMouseUp: (() -> Void)?
+        private var eventMonitor: Any?
+
+        deinit {
+            if let eventMonitor {
+                NSEvent.removeMonitor(eventMonitor)
+            }
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            nil
+        }
+
+        func install() {
+            guard eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp, .otherMouseUp]) { [weak self] event in
+                guard
+                    let self,
+                    event.window === self.window,
+                    self.isActive
+                else {
+                    return event
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    self?.onMouseUp?()
                 }
 
                 return event
