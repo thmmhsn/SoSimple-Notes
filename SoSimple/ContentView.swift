@@ -15,6 +15,8 @@ private let inboxTaskTitle = "Inbox"
 private let laterTaskTitle = "Later"
 private let outlineItemDragUTType = UTType(exportedAs: "com.th.SoSimple.outline-item-id")
 private let outlineItemDropTypes = [outlineItemDragUTType, UTType.plainText]
+private let outlineItemsPasteboardType = NSPasteboard.PasteboardType("com.th.SoSimple.outline-items-json")
+private let subnoteICloudContainerIdentifier = "iCloud.com.th.SoSimple"
 private let hashtagRegex = try? NSRegularExpression(pattern: #"(?<!\S)#([A-Za-z0-9_-]+)"#)
 
 private func hashtagMatches(in title: String) -> [NSTextCheckingResult] {
@@ -54,6 +56,13 @@ private func taskSidebarDisplayTitle(_ title: String) -> String {
 }
 
 private func outlineItemsFromPasteboard(_ pasteboard: NSPasteboard) -> [OutlineItem] {
+    if
+        let data = pasteboard.data(forType: outlineItemsPasteboardType),
+        let items = try? JSONDecoder().decode([OutlineItem].self, from: data),
+        !items.isEmpty {
+        return items
+    }
+
     for source in attributedPasteSources {
         guard
             let data = pasteboard.data(forType: source.type),
@@ -77,6 +86,44 @@ private func outlineItemsFromPasteboard(_ pasteboard: NSPasteboard) -> [OutlineI
 
     guard let text = pasteboard.string(forType: .string) else { return [] }
     return outlineItemsFromPastedText(text)
+}
+
+@discardableResult
+private func copyOutlineItemsToPasteboard(_ items: [OutlineItem]) -> Bool {
+    guard !items.isEmpty else { return false }
+
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+
+    let copiedItems = items.map(copyForPaste)
+    if let data = try? JSONEncoder().encode(copiedItems) {
+        pasteboard.setData(data, forType: outlineItemsPasteboardType)
+    }
+
+    return pasteboard.setString(outlinePlainText(from: items), forType: .string)
+}
+
+private func copyForPaste(_ item: OutlineItem) -> OutlineItem {
+    OutlineItem(
+        title: item.title,
+        isExpanded: item.isExpanded,
+        isComplete: item.isComplete,
+        tags: item.tags,
+        children: item.children.map(copyForPaste)
+    )
+}
+
+private func outlinePlainText(from items: [OutlineItem]) -> String {
+    var lines: [String] = []
+    appendPlainTextLines(from: items, depth: 0, to: &lines)
+    return lines.joined(separator: "\n")
+}
+
+private func appendPlainTextLines(from items: [OutlineItem], depth: Int, to lines: inout [String]) {
+    for item in items {
+        lines.append(String(repeating: "\t", count: depth) + item.title)
+        appendPlainTextLines(from: item.children, depth: depth + 1, to: &lines)
+    }
 }
 
 private let attributedPasteSources: [(type: NSPasteboard.PasteboardType, documentType: NSAttributedString.DocumentType)] = [
@@ -360,6 +407,130 @@ private struct SidebarCacheSignature: Equatable {
     let projectTitle: String?
 }
 
+private struct CodexNodeEditPayload: Codable {
+    let instruction: String
+    let path: [String]
+    let node: OutlineItem
+}
+
+private enum CodexNodeEditError: LocalizedError {
+    case emptyInstruction
+    case missingNode
+    case launchFailed(String)
+    case failed(String)
+    case invalidResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyInstruction:
+            return "Type an edit instruction first."
+        case .missingNode:
+            return "Select or focus a note before editing with AI."
+        case .launchFailed(let message):
+            return "Could not start Codex: \(message)"
+        case .failed(let message):
+            return message.isEmpty ? "Codex could not edit this note." : message
+        case .invalidResponse:
+            return "Codex returned an invalid edit."
+        }
+    }
+}
+
+private enum CodexNodeEditor {
+    static func edit(node: OutlineItem, path: [String], instruction: String) async throws -> OutlineItem {
+        let trimmedInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedInstruction.isEmpty else { throw CodexNodeEditError.emptyInstruction }
+
+        let payload = CodexNodeEditPayload(instruction: trimmedInstruction, path: path, node: node)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let payloadData = try encoder.encode(payload)
+        guard let payloadJSON = String(data: payloadData, encoding: .utf8) else {
+            throw CodexNodeEditError.invalidResponse
+        }
+
+        let prompt = """
+        You are editing one Subnote outline node.
+        Apply the user's instruction to the provided node and its children only.
+        Preserve the JSON shape of OutlineItem: id, title, isExpanded, isComplete, tags, children.
+        Preserve existing ids for nodes that still represent the same note.
+        Return only the edited node as raw JSON. Do not include Markdown, comments, or explanation.
+
+        \(payloadJSON)
+        """
+
+        return try await runCodex(with: prompt, originalID: node.id)
+    }
+
+    private static func runCodex(with prompt: String, originalID: UUID) async throws -> OutlineItem {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                    process.arguments = [
+                        "-lc",
+                        "codex exec --skip-git-repo-check --ephemeral --sandbox read-only --ask-for-approval never -"
+                    ]
+
+                    let inputPipe = Pipe()
+                    let outputPipe = Pipe()
+                    let errorPipe = Pipe()
+                    process.standardInput = inputPipe
+                    process.standardOutput = outputPipe
+                    process.standardError = errorPipe
+
+                    try process.run()
+
+                    if let data = prompt.data(using: .utf8) {
+                        inputPipe.fileHandleForWriting.write(data)
+                    }
+                    inputPipe.fileHandleForWriting.closeFile()
+
+                    process.waitUntilExit()
+
+                    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    let output = String(data: outputData, encoding: .utf8) ?? ""
+                    let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
+
+                    guard process.terminationStatus == 0 else {
+                        throw CodexNodeEditError.failed(errorOutput.trimmingCharacters(in: .whitespacesAndNewlines))
+                    }
+
+                    let editedNode = try decodeEditedNode(from: output, originalID: originalID)
+                    continuation.resume(returning: editedNode)
+                } catch let error as CodexNodeEditError {
+                    continuation.resume(throwing: error)
+                } catch {
+                    continuation.resume(throwing: CodexNodeEditError.launchFailed(error.localizedDescription))
+                }
+            }
+        }
+    }
+
+    private static func decodeEditedNode(from output: String, originalID: UUID) throws -> OutlineItem {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let jsonText: String
+        if
+            let start = trimmed.firstIndex(of: "{"),
+            let end = trimmed.lastIndex(of: "}"),
+            start <= end {
+            jsonText = String(trimmed[start...end])
+        } else {
+            jsonText = trimmed
+        }
+
+        guard let data = jsonText.data(using: .utf8) else {
+            throw CodexNodeEditError.invalidResponse
+        }
+
+        var editedNode = try JSONDecoder().decode(OutlineItem.self, from: data)
+        editedNode.id = originalID
+        return editedNode
+    }
+}
+
 @MainActor
 final class OutlineStore: ObservableObject {
     @Published private(set) var items: [OutlineItem] = [] {
@@ -454,6 +625,21 @@ final class OutlineStore: ObservableObject {
         guard let focusedItemID else { return nil }
         guard let summary = itemSummaries[focusedItemID] else { return nil }
         return OutlineItem(id: focusedItemID, title: summary.title, isComplete: summary.isComplete)
+    }
+
+    func item(for id: UUID) -> OutlineItem? {
+        findItem(with: id, in: items)
+    }
+
+    func path(for id: UUID) -> [String] {
+        var ids = [UUID]()
+        var currentID: UUID? = id
+        while let current = currentID {
+            ids.append(current)
+            currentID = parentByID[current]
+        }
+
+        return ids.reversed().compactMap { itemSummaries[$0]?.title }
     }
 
     func parentItemIDs() -> Set<UUID> {
@@ -721,6 +907,14 @@ final class OutlineStore: ObservableObject {
         removeItems(with: ids, from: &items)
     }
 
+    func replaceItem(with id: UUID, using replacement: OutlineItem) -> Bool {
+        var replacement = replacement
+        replacement.id = id
+        return update(id) { item in
+            item = replacement
+        }
+    }
+
     func toggleExpanded(_ id: UUID) {
         update(id) { item in
             item.isExpanded.toggle()
@@ -748,7 +942,33 @@ final class OutlineStore: ObservableObject {
         searchResultsCache = nil
     }
 
+    func copyableItems(for ids: Set<UUID>) -> [OutlineItem] {
+        guard !ids.isEmpty else { return [] }
+        var copiedItems: [OutlineItem] = []
+        appendCopyableItems(in: items, selectedIDs: ids, to: &copiedItems)
+        return copiedItems
+    }
+
     private static func makeStorageURL() -> URL {
+        let localURL = localStorageURL()
+        if
+            let containerURL = FileManager.default.url(forUbiquityContainerIdentifier: subnoteICloudContainerIdentifier) ??
+                FileManager.default.url(forUbiquityContainerIdentifier: nil) {
+            let directory = containerURL
+                .appendingPathComponent("Documents", isDirectory: true)
+                .appendingPathComponent("Subnote", isDirectory: true)
+            let cloudURL = directory.appendingPathComponent("outline.json")
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: cloudURL.path),
+               FileManager.default.fileExists(atPath: localURL.path) {
+                try? FileManager.default.copyItem(at: localURL, to: cloudURL)
+            }
+            return cloudURL
+        }
+        return localURL
+    }
+
+    private static func localStorageURL() -> URL {
         let baseURL = try? FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -953,6 +1173,18 @@ final class OutlineStore: ObservableObject {
         return false
     }
 
+    private func findItem(with id: UUID, in source: [OutlineItem]) -> OutlineItem? {
+        for item in source {
+            if item.id == id {
+                return item
+            }
+            if let child = findItem(with: id, in: item.children) {
+                return child
+            }
+        }
+        return nil
+    }
+
     private func insert(_ item: OutlineItem, after id: UUID, in source: inout [OutlineItem]) -> Bool {
         for index in source.indices {
             if source[index].id == id {
@@ -1022,6 +1254,16 @@ final class OutlineStore: ObservableObject {
         source.removeAll { ids.contains($0.id) }
         for index in source.indices {
             removeItems(with: ids, from: &source[index].children)
+        }
+    }
+
+    private func appendCopyableItems(in source: [OutlineItem], selectedIDs: Set<UUID>, to copiedItems: inout [OutlineItem]) {
+        for item in source {
+            if selectedIDs.contains(item.id) {
+                copiedItems.append(item)
+            } else {
+                appendCopyableItems(in: item.children, selectedIDs: selectedIDs, to: &copiedItems)
+            }
         }
     }
 
@@ -1300,6 +1542,7 @@ struct ContentView: View {
     let minimumWidth: CGFloat
     let updatesWindowTitle: Bool
     let hidesCompletedItems: Bool
+    let onAIContextChange: (UUID?) -> Void
     @Binding private var focusRequest: UUID?
     @Environment(\.undoManager) private var undoManager
     @State private var paneID = UUID()
@@ -1323,12 +1566,14 @@ struct ContentView: View {
         minimumWidth: CGFloat = 720,
         updatesWindowTitle: Bool = true,
         focusRequest: Binding<UUID?> = .constant(nil),
-        hidesCompletedItems: Bool = false
+        hidesCompletedItems: Bool = false,
+        onAIContextChange: @escaping (UUID?) -> Void = { _ in }
     ) {
         self.store = store
         self.minimumWidth = minimumWidth
         self.updatesWindowTitle = updatesWindowTitle
         self.hidesCompletedItems = hidesCompletedItems
+        self.onAIContextChange = onAIContextChange
         self._focusRequest = focusRequest
     }
 
@@ -1370,6 +1615,9 @@ struct ContentView: View {
                     },
                     onDeleteSelection: {
                         requestDeleteSelection()
+                    },
+                    onCopyOutline: {
+                        copyCurrentOutlineItems()
                     }
                 )
                 .frame(width: 0, height: 0)
@@ -1420,6 +1668,7 @@ struct ContentView: View {
                                     set: { store.setTitle($0, for: focusedItem.id) }
                                 ),
                                 onBeginEditing: {
+                                    onAIContextChange(focusedItem.id)
                                     isFocusedTitleEditing = true
                                     editingItemID = nil
                                 },
@@ -1459,11 +1708,13 @@ struct ContentView: View {
                                     focusAndEditFirstVisible(item.id)
                                 },
                                 onRowInteraction: {
+                                    onAIContextChange(item.id)
                                     clearSelection()
                                 },
                                 onAddChild: {
                                     let childID = store.addChild(to: item.id)
                                     collapsedItemIDs.remove(item.id)
+                                    onAIContextChange(childID)
                                     editingItemID = childID
                                 },
                                 onMoveUp: {
@@ -1481,15 +1732,18 @@ struct ContentView: View {
                                         collapsedItemIDs.remove(item.id)
                                         let newID = store.addFirstChild(to: item.id)
                                         registerUndoForCreatedItem(newID)
+                                        onAIContextChange(newID)
                                         editingItemID = newID
                                     } else {
                                         let newID = store.addSibling(after: item.id)
                                         registerUndoForCreatedItem(newID)
+                                        onAIContextChange(newID)
                                         editingItemID = newID
                                     }
                                 },
                                 onPasteOutline: { pastedItems in
                                     if let pastedID = store.pasteOutline(pastedItems, at: item.id) {
+                                        onAIContextChange(pastedID)
                                         editingItemID = pastedID
                                         collapsedItemIDs.remove(pastedID)
                                     }
@@ -1498,11 +1752,13 @@ struct ContentView: View {
                                     if let parentID = previousVisibleItem(before: item.id) {
                                         store.indent(item.id, under: parentID)
                                         collapsedItemIDs.remove(parentID)
+                                        onAIContextChange(item.id)
                                         editingItemID = item.id
                                     }
                                 },
                                 onOutdent: {
                                     store.outdent(item.id)
+                                    onAIContextChange(item.id)
                                     editingItemID = item.id
                                 },
                                 onToggleComplete: {
@@ -1565,6 +1821,7 @@ struct ContentView: View {
                 focusedItemID = nil
                 editingItemID = nil
                 selectedItemIDs = []
+                onAIContextChange(nil)
             } label: {
                 Image(systemName: "house")
             }
@@ -1611,6 +1868,7 @@ struct ContentView: View {
         isFocusedTitleEditing = false
         selectedItemIDs = []
         focusedItemID = id
+        onAIContextChange(id)
         editingItemID = visibleItems.first?.id
     }
 
@@ -1618,6 +1876,7 @@ struct ContentView: View {
         isFocusedTitleEditing = false
         selectedItemIDs = []
         focusedItemID = id
+        onAIContextChange(id)
         editingItemID = nil
     }
 
@@ -1627,10 +1886,12 @@ struct ContentView: View {
             collapsedItemIDs.remove(focusedItemID)
             let newID = store.addChild(to: focusedItemID)
             registerUndoForCreatedItem(newID)
+            onAIContextChange(newID)
             editingItemID = newID
         } else {
             let newID = store.addRoot()
             registerUndoForCreatedItem(newID)
+            onAIContextChange(newID)
             editingItemID = newID
         }
     }
@@ -1654,6 +1915,23 @@ struct ContentView: View {
         editingItemID = nil
     }
 
+    private func copyCurrentOutlineItems() -> Bool {
+        let itemIDs: Set<UUID>
+        if !selectedItemIDs.isEmpty {
+            itemIDs = selectedItemIDs
+        } else if let editingItemID {
+            itemIDs = [editingItemID]
+        } else if isFocusedTitleEditing, let focusedItemID {
+            itemIDs = [focusedItemID]
+        } else {
+            return false
+        }
+
+        let items = store.copyableItems(for: itemIDs)
+        guard !items.isEmpty else { return false }
+        return copyOutlineItemsToPasteboard(items)
+    }
+
     private func moveDraggedItem(_ id: UUID, to placement: OutlineDropPlacement, relativeTo targetID: UUID) {
         activeDropTarget = nil
         draggedItemID = nil
@@ -1663,6 +1941,7 @@ struct ContentView: View {
         }
         selectedItemIDs = []
         editingItemID = id
+        onAIContextChange(id)
     }
 
     private func registerUndoForCreatedItem(_ id: UUID) {
@@ -1787,9 +2066,11 @@ struct WorkspaceView: View {
     @State private var isPinnedSidebarEnabled = true
     @State private var isTaskSidebarEnabled = true
     @State private var isSearchPresented = false
-    @State private var hidesCompletedGlobally = false
+    @State private var isAIEditorPresented = false
+    @AppStorage("subnote.hideDone.global") private var hidesCompletedGlobally = false
     @State private var selectedSidebarTag: String?
     @State private var mainFocusRequest: UUID?
+    @State private var activeAIItemID: UUID?
 
     var body: some View {
         ZStack {
@@ -1813,13 +2094,19 @@ struct WorkspaceView: View {
                                 minimumWidth: 320,
                                 updatesWindowTitle: false,
                                 focusRequest: $mainFocusRequest,
-                                hidesCompletedItems: hidesCompletedGlobally
+                                hidesCompletedItems: hidesCompletedGlobally,
+                                onAIContextChange: { id in
+                                    activeAIItemID = id
+                                }
                             )
                             ContentView(
                                 store: store,
                                 minimumWidth: 320,
                                 updatesWindowTitle: false,
-                                hidesCompletedItems: hidesCompletedGlobally
+                                hidesCompletedItems: hidesCompletedGlobally,
+                                onAIContextChange: { id in
+                                    activeAIItemID = id
+                                }
                             )
                         }
                         .background(WindowTabConfigurator(title: "Split View"))
@@ -1827,7 +2114,10 @@ struct WorkspaceView: View {
                         ContentView(
                             store: store,
                             focusRequest: $mainFocusRequest,
-                            hidesCompletedItems: hidesCompletedGlobally
+                            hidesCompletedItems: hidesCompletedGlobally,
+                            onAIContextChange: { id in
+                                activeAIItemID = id
+                            }
                         )
                     }
                 }
@@ -1857,6 +2147,17 @@ struct WorkspaceView: View {
                 )
                 .transition(.opacity.combined(with: .scale(scale: 0.98)))
             }
+
+            if isAIEditorPresented {
+                CodexEditView(
+                    store: store,
+                    targetItemID: activeAIItemID,
+                    onDismiss: {
+                        isAIEditorPresented = false
+                    }
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            }
         }
         .background(
             WorkspaceCommandReceiver(
@@ -1871,6 +2172,9 @@ struct WorkspaceView: View {
                 },
                 onOpenSearch: {
                     isSearchPresented = true
+                },
+                onOpenAIEditor: {
+                    isAIEditorPresented = true
                 }
             )
         )
@@ -1915,6 +2219,129 @@ struct WorkspaceView: View {
                 )
             }
             .help(isSplitViewEnabled ? "Close Split View" : "Open Split View")
+        }
+    }
+}
+
+struct CodexEditView: View {
+    @ObservedObject var store: OutlineStore
+    let targetItemID: UUID?
+    let onDismiss: () -> Void
+    @Environment(\.undoManager) private var undoManager
+    @State private var instruction = ""
+    @State private var isSubmitting = false
+    @State private var errorMessage: String?
+    @FocusState private var isPromptFocused: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color.black.opacity(colorScheme == .dark ? 0.28 : 0.16)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onDismiss)
+
+            VStack(spacing: 0) {
+                promptField
+
+                if let errorMessage {
+                    Divider()
+                    Text(errorMessage)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 12)
+                }
+            }
+            .frame(width: 620)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(colorScheme == .dark ? 0.32 : 0.18), radius: 28, y: 18)
+            .padding(.top, 82)
+        }
+        .background(
+            AIEditKeyboardMonitor(onDismiss: onDismiss)
+                .frame(width: 0, height: 0)
+        )
+        .onAppear {
+            DispatchQueue.main.async {
+                isPromptFocused = true
+            }
+        }
+    }
+
+    private var promptField: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 24)
+
+            TextField("Ask Codex to edit this note", text: $instruction)
+                .textFieldStyle(.plain)
+                .font(.system(size: 22, weight: .regular))
+                .focused($isPromptFocused)
+                .disabled(isSubmitting)
+                .onSubmit {
+                    submit()
+                }
+
+            if isSubmitting {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 24)
+            } else if !instruction.isEmpty {
+                Button {
+                    submit()
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Submit")
+            }
+        }
+        .padding(.horizontal, 18)
+        .frame(height: 62)
+    }
+
+    private func submit() {
+        guard !isSubmitting else { return }
+        isSubmitting = true
+        errorMessage = nil
+
+        Task {
+            do {
+                guard let targetItemID, let node = store.item(for: targetItemID) else {
+                    throw CodexNodeEditError.missingNode
+                }
+
+                let editedNode = try await CodexNodeEditor.edit(
+                    node: node,
+                    path: store.path(for: targetItemID),
+                    instruction: instruction
+                )
+
+                guard store.replaceItem(with: targetItemID, using: editedNode) else {
+                    throw CodexNodeEditError.missingNode
+                }
+
+                undoManager?.registerUndo(withTarget: store) { store in
+                    Task { @MainActor in
+                        _ = store.replaceItem(with: targetItemID, using: node)
+                    }
+                }
+                undoManager?.setActionName("Edit with AI")
+                onDismiss()
+            } catch {
+                errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                isSubmitting = false
+            }
         }
     }
 }
@@ -2199,10 +2626,17 @@ struct TagSidebar: View {
     @ObservedObject var store: OutlineStore
     @Binding var selectedTag: String?
     let onOpenItem: (UUID) -> Void
+
+    private enum ProjectFilter: Hashable {
+        case all
+        case noProject
+        case project(String)
+    }
+
     @State private var paneID = UUID()
     @State private var editingItemID: UUID?
-    @State private var hidesCompletedItems = false
-    @State private var selectedProjectTitle: String?
+    @AppStorage("subnote.hideDone.tasks") private var hidesCompletedItems = false
+    @State private var selectedProjectFilter = ProjectFilter.all
     @State private var isTaskOptionsPresented = false
     @Environment(\.colorScheme) private var colorScheme
 
@@ -2287,14 +2721,18 @@ struct TagSidebar: View {
             }
         }
         .onChange(of: selectedTag) { _, _ in
-            selectedProjectTitle = nil
+            selectedProjectFilter = .all
         }
     }
 
     private var projectFilterMenu: some View {
         Menu {
             Button("All Projects") {
-                selectedProjectTitle = nil
+                selectedProjectFilter = .all
+            }
+
+            Button("No Project") {
+                selectedProjectFilter = .noProject
             }
 
             if !projectOptions.isEmpty {
@@ -2303,12 +2741,12 @@ struct TagSidebar: View {
 
             ForEach(projectOptions, id: \.self) { projectTitle in
                 Button(titleHidingSidebarMarkers(projectTitle)) {
-                    selectedProjectTitle = projectTitle
+                    selectedProjectFilter = .project(projectTitle)
                 }
             }
         } label: {
             Label(
-                selectedProjectTitle.map(titleHidingSidebarMarkers) ?? "All Projects",
+                projectFilterTitle,
                 systemImage: "folder"
             )
             .font(.system(size: 12, weight: .semibold))
@@ -2358,16 +2796,31 @@ struct TagSidebar: View {
             if hidesCompletedItems, store.isComplete(item.id) {
                 return false
             }
-            if let selectedProjectTitle {
+            switch selectedProjectFilter {
+            case .all:
+                return true
+            case .noProject:
+                return item.projectTitle == nil
+            case .project(let selectedProjectTitle):
                 return item.projectTitle == selectedProjectTitle
             }
-            return true
         }
     }
 
     private var projectOptions: [String] {
         Array(Set(store.taskItems(filteredBy: selectedTag).compactMap(\.projectTitle)))
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private var projectFilterTitle: String {
+        switch selectedProjectFilter {
+        case .all:
+            return "All Projects"
+        case .noProject:
+            return "No Project"
+        case .project(let title):
+            return titleHidingSidebarMarkers(title)
+        }
     }
 
     private func isBucketItem(_ item: TaggedOutlineItem) -> Bool {
@@ -3338,6 +3791,7 @@ struct RowKeyboardMonitor: NSViewRepresentable {
     let onMoveDown: (UUID) -> Void
     let onDeleteIfEmpty: (UUID) -> Bool
     let onDeleteSelection: () -> Void
+    let onCopyOutline: () -> Bool
 
     func makeNSView(context: Context) -> MonitorView {
         let view = MonitorView()
@@ -3353,6 +3807,7 @@ struct RowKeyboardMonitor: NSViewRepresentable {
         view.onMoveDown = onMoveDown
         view.onDeleteIfEmpty = onDeleteIfEmpty
         view.onDeleteSelection = onDeleteSelection
+        view.onCopyOutline = onCopyOutline
     }
 
     final class MonitorView: NSView {
@@ -3363,6 +3818,7 @@ struct RowKeyboardMonitor: NSViewRepresentable {
         var onMoveDown: ((UUID) -> Void)?
         var onDeleteIfEmpty: ((UUID) -> Bool)?
         var onDeleteSelection: (() -> Void)?
+        var onCopyOutline: (() -> Bool)?
         private var eventMonitor: Any?
 
         deinit {
@@ -3379,6 +3835,20 @@ struct RowKeyboardMonitor: NSViewRepresentable {
                     event.window === self.window
                 else {
                     return event
+                }
+
+                let shortcutFlags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+                if shortcutFlags == [.command, .shift], self.isCopyShortcut(event) {
+                    if let firstResponder = self.window?.firstResponder as? KeyHandlingTextView {
+                        guard firstResponder.paneID == self.paneID else {
+                            return event
+                        }
+                        return self.onCopyOutline?() == true ? nil : event
+                    }
+
+                    if !self.selectedItemIDs.isEmpty {
+                        return self.onCopyOutline?() == true ? nil : event
+                    }
                 }
 
                 guard
@@ -3405,7 +3875,6 @@ struct RowKeyboardMonitor: NSViewRepresentable {
                     return event
                 }
 
-                let shortcutFlags = event.modifierFlags.intersection([.command, .shift, .option, .control])
                 if shortcutFlags == [.command, .shift] {
                     return event
                 }
@@ -3428,6 +3897,10 @@ struct RowKeyboardMonitor: NSViewRepresentable {
 
                 return event
             }
+        }
+
+        private func isCopyShortcut(_ event: NSEvent) -> Bool {
+            event.keyCode == 8 || event.charactersIgnoringModifiers?.lowercased() == "c"
         }
     }
 }
@@ -3501,6 +3974,50 @@ struct SearchKeyboardMonitor: NSViewRepresentable {
     }
 }
 
+struct AIEditKeyboardMonitor: NSViewRepresentable {
+    let onDismiss: () -> Void
+
+    func makeNSView(context: Context) -> MonitorView {
+        let view = MonitorView()
+        view.install()
+        return view
+    }
+
+    func updateNSView(_ view: MonitorView, context: Context) {
+        view.onDismiss = onDismiss
+    }
+
+    final class MonitorView: NSView {
+        var onDismiss: (() -> Void)?
+        private var eventMonitor: Any?
+
+        deinit {
+            if let eventMonitor {
+                NSEvent.removeMonitor(eventMonitor)
+            }
+        }
+
+        func install() {
+            guard eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard
+                    let self,
+                    event.window === self.window
+                else {
+                    return event
+                }
+
+                if event.keyCode == 53 {
+                    self.onDismiss?()
+                    return nil
+                }
+
+                return event
+            }
+        }
+    }
+}
+
 struct WindowTabConfigurator: NSViewRepresentable {
     let title: String
 
@@ -3538,7 +4055,7 @@ struct WindowTabConfigurator: NSViewRepresentable {
             window.titlebarAppearsTransparent = false
             window.styleMask.remove(.fullSizeContentView)
             window.tabbingMode = .preferred
-            window.tabbingIdentifier = "SoSimpleOutlineWindow"
+            window.tabbingIdentifier = "SubnoteOutlineWindow"
         }
     }
 }
@@ -3548,6 +4065,7 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
     let onTogglePinnedSidebar: () -> Void
     let onToggleTaskSidebar: () -> Void
     let onOpenSearch: () -> Void
+    let onOpenAIEditor: () -> Void
 
     func makeNSView(context: Context) -> ReceiverView {
         let view = ReceiverView()
@@ -3555,6 +4073,7 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
         view.onTogglePinnedSidebar = onTogglePinnedSidebar
         view.onToggleTaskSidebar = onToggleTaskSidebar
         view.onOpenSearch = onOpenSearch
+        view.onOpenAIEditor = onOpenAIEditor
         view.install()
         return view
     }
@@ -3564,6 +4083,7 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
         view.onTogglePinnedSidebar = onTogglePinnedSidebar
         view.onToggleTaskSidebar = onToggleTaskSidebar
         view.onOpenSearch = onOpenSearch
+        view.onOpenAIEditor = onOpenAIEditor
     }
 
     final class ReceiverView: NSView {
@@ -3571,6 +4091,7 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
         var onTogglePinnedSidebar: (() -> Void)?
         var onToggleTaskSidebar: (() -> Void)?
         var onOpenSearch: (() -> Void)?
+        var onOpenAIEditor: (() -> Void)?
         private var observers: [NSObjectProtocol] = []
         private var keyMonitor: Any?
 
@@ -3603,6 +4124,9 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
                     return nil
                 case 3:
                     self.onOpenSearch?()
+                    return nil
+                case 14:
+                    self.onOpenAIEditor?()
                     return nil
                 default:
                     return event
@@ -3644,6 +4168,15 @@ struct WorkspaceCommandReceiver: NSViewRepresentable {
                 guard let self, self.isActiveWindow else { return }
                 self.onOpenSearch?()
             })
+
+            observers.append(NotificationCenter.default.addObserver(
+                forName: .openWorkspaceAIEditor,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, self.isActiveWindow else { return }
+                self.onOpenAIEditor?()
+            })
         }
 
         private var isActiveWindow: Bool {
@@ -3657,6 +4190,7 @@ extension Notification.Name {
     static let toggleWorkspacePinnedSidebar = Notification.Name("SoSimpleToggleWorkspacePinnedSidebar")
     static let toggleWorkspaceTaskSidebar = Notification.Name("SoSimpleToggleWorkspaceTaskSidebar")
     static let openWorkspaceSearch = Notification.Name("SoSimpleOpenWorkspaceSearch")
+    static let openWorkspaceAIEditor = Notification.Name("SoSimpleOpenWorkspaceAIEditor")
 }
 
 #Preview {

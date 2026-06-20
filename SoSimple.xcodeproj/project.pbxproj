@@ -6,8 +6,21 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		C0DE00000000000000000011 /* OutlineCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000003 /* OutlineCore.swift */; };
+		C0DE00000000000000000012 /* PhoneViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000004 /* PhoneViews.swift */; };
+		C0DE00000000000000000013 /* SubnoteIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000005 /* SubnoteIOSApp.swift */; };
+		C0DE00000000000000000014 /* SoSimple/Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000007 /* SoSimple/Assets.xcassets */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
-		BE230E422FCF4F240044921D /* SoSimple.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SoSimple.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		BE230E422FCF4F240044921D /* Subnote.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Subnote.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0DE00000000000000000001 /* Subnote iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; name = "Subnote iOS.app"; path = Subnote.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0DE00000000000000000003 /* OutlineCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutlineCore.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000004 /* PhoneViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneViews.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000005 /* SubnoteIOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubnoteIOSApp.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000006 /* SubnoteIOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = SubnoteIOS.entitlements; sourceTree = "<group>"; };
+		C0DE00000000000000000007 /* SoSimple/Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = SoSimple/Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -26,6 +39,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C0DE00000000000000000022 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -33,6 +53,8 @@
 			isa = PBXGroup;
 			children = (
 				BE230E442FCF4F240044921D /* SoSimple */,
+				C0DE00000000000000000002 /* SubnoteIOS */,
+				C0DE00000000000000000007 /* SoSimple/Assets.xcassets */,
 				BE230E432FCF4F240044921D /* Products */,
 			);
 			sourceTree = "<group>";
@@ -40,9 +62,21 @@
 		BE230E432FCF4F240044921D /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				BE230E422FCF4F240044921D /* SoSimple.app */,
+				BE230E422FCF4F240044921D /* Subnote.app */,
+				C0DE00000000000000000001 /* Subnote iOS.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		C0DE00000000000000000002 /* SubnoteIOS */ = {
+			isa = PBXGroup;
+			children = (
+				C0DE00000000000000000003 /* OutlineCore.swift */,
+				C0DE00000000000000000004 /* PhoneViews.swift */,
+				C0DE00000000000000000005 /* SubnoteIOSApp.swift */,
+				C0DE00000000000000000006 /* SubnoteIOS.entitlements */,
+			);
+			path = SubnoteIOS;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -66,8 +100,27 @@
 			name = SoSimple;
 			packageProductDependencies = (
 			);
-			productName = SoSimple;
-			productReference = BE230E422FCF4F240044921D /* SoSimple.app */;
+			productName = Subnote;
+			productReference = BE230E422FCF4F240044921D /* Subnote.app */;
+			productType = "com.apple.product-type.application";
+		};
+		C0DE00000000000000000031 /* Subnote iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C0DE00000000000000000032 /* Build configuration list for PBXNativeTarget "Subnote iOS" */;
+			buildPhases = (
+				C0DE00000000000000000021 /* Sources */,
+				C0DE00000000000000000022 /* Frameworks */,
+				C0DE00000000000000000023 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "Subnote iOS";
+			packageProductDependencies = (
+			);
+			productName = Subnote;
+			productReference = C0DE00000000000000000001 /* Subnote iOS.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -81,6 +134,9 @@
 				LastUpgradeCheck = 2610;
 				TargetAttributes = {
 					BE230E412FCF4F240044921D = {
+						CreatedOnToolsVersion = 26.1.1;
+					};
+					C0DE00000000000000000031 = {
 						CreatedOnToolsVersion = 26.1.1;
 					};
 				};
@@ -100,6 +156,7 @@
 			projectRoot = "";
 			targets = (
 				BE230E412FCF4F240044921D /* SoSimple */,
+				C0DE00000000000000000031 /* Subnote iOS */,
 			);
 		};
 /* End PBXProject section */
@@ -112,6 +169,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C0DE00000000000000000023 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C0DE00000000000000000014 /* SoSimple/Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -119,6 +184,16 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C0DE00000000000000000021 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C0DE00000000000000000013 /* SubnoteIOSApp.swift in Sources */,
+				C0DE00000000000000000011 /* OutlineCore.swift in Sources */,
+				C0DE00000000000000000012 /* PhoneViews.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -250,6 +325,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = SoSimple/SoSimple.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -259,6 +335,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Subnote;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -266,7 +343,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.th.SoSimple;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = Subnote;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -282,6 +359,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = SoSimple/SoSimple.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -291,6 +369,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Subnote;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -298,7 +377,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.th.SoSimple;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = Subnote;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -306,6 +385,74 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		C0DE00000000000000000033 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = SubnoteIOS/SubnoteIOS.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = GTF45UH2VQ;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Subnote;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.th.Subnote;
+				PRODUCT_NAME = Subnote;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		C0DE00000000000000000034 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = SubnoteIOS/SubnoteIOS.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = GTF45UH2VQ;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Subnote;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.th.Subnote;
+				PRODUCT_NAME = Subnote;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
 		};
@@ -326,6 +473,15 @@
 			buildConfigurations = (
 				BE230E532FCF4F240044921D /* Debug */,
 				BE230E542FCF4F240044921D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C0DE00000000000000000032 /* Build configuration list for PBXNativeTarget "Subnote iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C0DE00000000000000000033 /* Debug */,
+				C0DE00000000000000000034 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

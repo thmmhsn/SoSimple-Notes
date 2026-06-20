@@ -33,6 +33,11 @@ struct SoSimpleApp: App {
                 }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
 
+                Button("Edit with AI") {
+                    NotificationCenter.default.post(name: .openWorkspaceAIEditor, object: nil)
+                }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+
                 Button("Toggle Split View") {
                     NotificationCenter.default.post(name: .toggleWorkspaceSplitView, object: nil)
                 }
@@ -84,11 +89,11 @@ final class NativeTabController: NSObject, NSWindowDelegate {
     }
 
     private func configure(_ window: NSWindow) {
-        window.title = "SoSimple"
+        window.title = "Subnote"
         window.titleVisibility = .visible
         window.titlebarAppearsTransparent = false
         window.styleMask.remove(.fullSizeContentView)
         window.tabbingMode = .preferred
-        window.tabbingIdentifier = "SoSimpleOutlineWindow"
+        window.tabbingIdentifier = "SubnoteOutlineWindow"
     }
 }
