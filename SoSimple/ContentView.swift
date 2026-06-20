@@ -6,6 +6,7 @@
 //
 
 import Combine
+import Darwin
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -413,9 +414,16 @@ private struct CodexNodeEditPayload: Codable {
     let node: OutlineItem
 }
 
+private struct CodexLaunchCommand {
+    let executableURL: URL
+    let argumentsPrefix: [String]
+    let binDirectoryURL: URL
+}
+
 private enum CodexNodeEditError: LocalizedError {
     case emptyInstruction
     case missingNode
+    case executableNotFound
     case launchFailed(String)
     case failed(String)
     case invalidResponse
@@ -426,6 +434,8 @@ private enum CodexNodeEditError: LocalizedError {
             return "Type an edit instruction first."
         case .missingNode:
             return "Select or focus a note before editing with AI."
+        case .executableNotFound:
+            return "Could not find the Codex CLI. Install Codex or add it to a standard shell path."
         case .launchFailed(let message):
             return "Could not start Codex: \(message)"
         case .failed(let message):
@@ -450,12 +460,36 @@ private enum CodexNodeEditor {
         }
 
         let prompt = """
-        You are editing one Subnote outline node.
-        Apply the user's instruction to the provided node and its children only.
-        Preserve the JSON shape of OutlineItem: id, title, isExpanded, isComplete, tags, children.
-        Preserve existing ids for nodes that still represent the same note.
-        Return only the edited node as raw JSON. Do not include Markdown, comments, or explanation.
+        You are Subnote's focused-note editor.
 
+        The JSON payload below contains:
+        - instruction: the user's edit request.
+        - path: breadcrumb titles from Home to the currently focused note.
+        - node: the currently focused note. Its title is the note text. Its children are nested subnotes/tasks.
+
+        Edit only this focused note subtree. Treat all references like "this", "it", "the note", "current note", "these tasks", and "this list" as referring to node and its children.
+
+        Do simple edits directly:
+        - Rename/rewrite/summarize/change wording: update node.title.
+        - Add checklist/items/subnotes: add OutlineItem entries to node.children.
+        - Remove/complete/reorder/organize items: edit node.children as requested.
+        - If the user asks for a small obvious change, make only that change.
+
+        Preserve the exact JSON shape of OutlineItem:
+        {
+          "id": UUID string,
+          "title": String,
+          "isExpanded": Bool,
+          "isComplete": Bool,
+          "tags": [String],
+          "children": [OutlineItem]
+        }
+
+        Preserve existing ids for any existing note that remains. New children may use fresh UUID strings. Keep tags, isExpanded, and isComplete unless the user asks to change them. Do not edit anything outside node.
+
+        Return only the edited node as raw JSON. No Markdown. No explanation. No code fence.
+
+        Payload:
         \(payloadJSON)
         """
 
@@ -466,12 +500,18 @@ private enum CodexNodeEditor {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
+                    let codexCommand = try codexLaunchCommand()
                     let process = Process()
-                    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                    process.arguments = [
-                        "-lc",
-                        "codex exec --skip-git-repo-check --ephemeral --sandbox read-only --ask-for-approval never -"
+                    process.executableURL = codexCommand.executableURL
+                    process.arguments = codexCommand.argumentsPrefix + [
+                        "exec",
+                        "--skip-git-repo-check",
+                        "--ephemeral",
+                        "--sandbox",
+                        "read-only",
+                        "-"
                     ]
+                    process.environment = codexEnvironment(for: codexCommand.binDirectoryURL)
 
                     let inputPipe = Pipe()
                     let outputPipe = Pipe()
@@ -507,6 +547,83 @@ private enum CodexNodeEditor {
                 }
             }
         }
+    }
+
+    private static func codexLaunchCommand() throws -> CodexLaunchCommand {
+        let fileManager = FileManager.default
+        let homeURL = userHomeDirectoryURL()
+
+        let bundledNVMNodeURL = homeURL.appendingPathComponent(".nvm/versions/node/v22.19.0/bin/node")
+        let bundledNVMCodexScriptURL = homeURL.appendingPathComponent(".nvm/versions/node/v22.19.0/lib/node_modules/@openai/codex/bin/codex.js")
+        if homeURL.path == "/Users/thameem" {
+            return CodexLaunchCommand(
+                executableURL: bundledNVMNodeURL,
+                argumentsPrefix: [bundledNVMCodexScriptURL.path],
+                binDirectoryURL: bundledNVMNodeURL.deletingLastPathComponent()
+            )
+        }
+
+        let environmentPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        let pathCandidates = environmentPath
+            .split(separator: ":")
+            .map { URL(fileURLWithPath: String($0)).appendingPathComponent("codex") }
+
+        let fixedCandidates = [
+            homeURL.appendingPathComponent(".nvm/versions/node/v22.19.0/bin/codex"),
+            homeURL.appendingPathComponent(".nvm/versions/node/v22.19.0/lib/node_modules/@openai/codex/bin/codex.js"),
+            homeURL.appendingPathComponent(".npm-global/bin/codex"),
+            homeURL.appendingPathComponent(".local/bin/codex"),
+            URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
+            URL(fileURLWithPath: "/usr/local/bin/codex")
+        ]
+
+        if let url = (pathCandidates + fixedCandidates).first(where: { fileManager.isExecutableFile(atPath: $0.path) }) {
+            return CodexLaunchCommand(
+                executableURL: url,
+                argumentsPrefix: [],
+                binDirectoryURL: url.deletingLastPathComponent()
+            )
+        }
+
+        let nvmVersionsURL = homeURL.appendingPathComponent(".nvm/versions/node")
+        if let versionURLs = try? fileManager.contentsOfDirectory(
+            at: nvmVersionsURL,
+            includingPropertiesForKeys: nil
+        ) {
+            let nvmCandidates = versionURLs
+                .map { $0.appendingPathComponent("bin/codex") }
+                .sorted { $0.path.localizedStandardCompare($1.path) == .orderedDescending }
+            if let url = nvmCandidates.first(where: { fileManager.isExecutableFile(atPath: $0.path) }) {
+                return CodexLaunchCommand(
+                    executableURL: url,
+                    argumentsPrefix: [],
+                    binDirectoryURL: url.deletingLastPathComponent()
+                )
+            }
+        }
+
+        throw CodexNodeEditError.executableNotFound
+    }
+
+    private static func codexEnvironment(for codexBinURL: URL) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        let codexBinPath = codexBinURL.path
+        let homePath = userHomeDirectoryURL().path
+        let defaultPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let currentPath = environment["PATH"] ?? defaultPath
+        if !currentPath.split(separator: ":").contains(where: { String($0) == codexBinPath }) {
+            environment["PATH"] = "\(codexBinPath):\(currentPath):\(defaultPath)"
+        }
+        environment["HOME"] = homePath
+        environment["CODEX_HOME"] = homePath + "/.codex"
+        return environment
+    }
+
+    private static func userHomeDirectoryURL() -> URL {
+        if let passwordRecord = getpwuid(getuid()), let home = passwordRecord.pointee.pw_dir {
+            return URL(fileURLWithPath: String(cString: home), isDirectory: true)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
     }
 
     private static func decodeEditedNode(from output: String, originalID: UUID) throws -> OutlineItem {
@@ -1708,13 +1825,13 @@ struct ContentView: View {
                                     focusAndEditFirstVisible(item.id)
                                 },
                                 onRowInteraction: {
-                                    onAIContextChange(item.id)
+                                    onAIContextChange(aiContextItemID(preferred: item.id))
                                     clearSelection()
                                 },
                                 onAddChild: {
                                     let childID = store.addChild(to: item.id)
                                     collapsedItemIDs.remove(item.id)
-                                    onAIContextChange(childID)
+                                    onAIContextChange(aiContextItemID(preferred: childID))
                                     editingItemID = childID
                                 },
                                 onMoveUp: {
@@ -1732,18 +1849,18 @@ struct ContentView: View {
                                         collapsedItemIDs.remove(item.id)
                                         let newID = store.addFirstChild(to: item.id)
                                         registerUndoForCreatedItem(newID)
-                                        onAIContextChange(newID)
+                                        onAIContextChange(aiContextItemID(preferred: newID))
                                         editingItemID = newID
                                     } else {
                                         let newID = store.addSibling(after: item.id)
                                         registerUndoForCreatedItem(newID)
-                                        onAIContextChange(newID)
+                                        onAIContextChange(aiContextItemID(preferred: newID))
                                         editingItemID = newID
                                     }
                                 },
                                 onPasteOutline: { pastedItems in
                                     if let pastedID = store.pasteOutline(pastedItems, at: item.id) {
-                                        onAIContextChange(pastedID)
+                                        onAIContextChange(aiContextItemID(preferred: pastedID))
                                         editingItemID = pastedID
                                         collapsedItemIDs.remove(pastedID)
                                     }
@@ -1752,13 +1869,13 @@ struct ContentView: View {
                                     if let parentID = previousVisibleItem(before: item.id) {
                                         store.indent(item.id, under: parentID)
                                         collapsedItemIDs.remove(parentID)
-                                        onAIContextChange(item.id)
+                                        onAIContextChange(aiContextItemID(preferred: item.id))
                                         editingItemID = item.id
                                     }
                                 },
                                 onOutdent: {
                                     store.outdent(item.id)
-                                    onAIContextChange(item.id)
+                                    onAIContextChange(aiContextItemID(preferred: item.id))
                                     editingItemID = item.id
                                 },
                                 onToggleComplete: {
@@ -1886,7 +2003,7 @@ struct ContentView: View {
             collapsedItemIDs.remove(focusedItemID)
             let newID = store.addChild(to: focusedItemID)
             registerUndoForCreatedItem(newID)
-            onAIContextChange(newID)
+            onAIContextChange(focusedItemID)
             editingItemID = newID
         } else {
             let newID = store.addRoot()
@@ -1941,7 +2058,7 @@ struct ContentView: View {
         }
         selectedItemIDs = []
         editingItemID = id
-        onAIContextChange(id)
+        onAIContextChange(aiContextItemID(preferred: id))
     }
 
     private func registerUndoForCreatedItem(_ id: UUID) {
@@ -2058,6 +2175,10 @@ struct ContentView: View {
     private func isPointInsideRow(_ point: CGPoint) -> Bool {
         rowFrames.values.contains { $0.contains(point) }
     }
+
+    private func aiContextItemID(preferred id: UUID?) -> UUID? {
+        focusedItemID ?? id
+    }
 }
 
 struct WorkspaceView: View {
@@ -2071,6 +2192,9 @@ struct WorkspaceView: View {
     @State private var selectedSidebarTag: String?
     @State private var mainFocusRequest: UUID?
     @State private var activeAIItemID: UUID?
+    @State private var aiEditInstruction = ""
+    @State private var isAIEditSubmitting = false
+    @State private var aiEditErrorMessage: String?
 
     var body: some View {
         ZStack {
@@ -2152,6 +2276,9 @@ struct WorkspaceView: View {
                 CodexEditView(
                     store: store,
                     targetItemID: activeAIItemID,
+                    instruction: $aiEditInstruction,
+                    isSubmitting: $isAIEditSubmitting,
+                    errorMessage: $aiEditErrorMessage,
                     onDismiss: {
                         isAIEditorPresented = false
                     }
@@ -2174,6 +2301,10 @@ struct WorkspaceView: View {
                     isSearchPresented = true
                 },
                 onOpenAIEditor: {
+                    if !isAIEditSubmitting {
+                        aiEditInstruction = ""
+                        aiEditErrorMessage = nil
+                    }
                     isAIEditorPresented = true
                 }
             )
@@ -2226,11 +2357,11 @@ struct WorkspaceView: View {
 struct CodexEditView: View {
     @ObservedObject var store: OutlineStore
     let targetItemID: UUID?
+    @Binding var instruction: String
+    @Binding var isSubmitting: Bool
+    @Binding var errorMessage: String?
     let onDismiss: () -> Void
     @Environment(\.undoManager) private var undoManager
-    @State private var instruction = ""
-    @State private var isSubmitting = false
-    @State private var errorMessage: String?
     @FocusState private var isPromptFocused: Bool
     @Environment(\.colorScheme) private var colorScheme
 
@@ -2268,6 +2399,7 @@ struct CodexEditView: View {
                 .frame(width: 0, height: 0)
         )
         .onAppear {
+            guard !isSubmitting else { return }
             DispatchQueue.main.async {
                 isPromptFocused = true
             }
@@ -2337,6 +2469,8 @@ struct CodexEditView: View {
                     }
                 }
                 undoManager?.setActionName("Edit with AI")
+                errorMessage = nil
+                isSubmitting = false
                 onDismiss()
             } catch {
                 errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
